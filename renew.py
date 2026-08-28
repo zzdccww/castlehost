@@ -229,6 +229,14 @@ class GitHubManager:
         self.token, self.repo = token, repo
         self.headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"} if token else {}
 
+    @staticmethod
+    async def _err_brief(r) -> str:
+        """截取 GitHub 错误响应正文，用于区分 token 过期 / 权限不足 / 仓库名写错。正文不含 token。"""
+        try:
+            return (await r.text())[:200].replace("\n", " ")
+        except Exception:
+            return ""
+
     async def update_secret(self, name: str, value: str) -> bool:
         if not self.token or not self.repo:
             return False
@@ -240,6 +248,8 @@ class GitHubManager:
                     headers=self.headers
                 ) as r:
                     if r.status != 200:
+                        # 401/403 通常是 REPO_TOKEN 过期或缺少 Secrets 写权限；静默返回会让回写失败无迹可查
+                        logger.error(f"❌ 取 public-key 失败: HTTP {r.status} {await self._err_brief(r)}")
                         return False
                     kd = await r.json()
                 pk = public.PublicKey(kd["key"].encode(), encoding.Base64Encoder())
@@ -252,6 +262,7 @@ class GitHubManager:
                     if r.status in [201, 204]:
                         logger.info(f"✅ Secret {name} 已更新")
                         return True
+                    logger.error(f"❌ Secret {name} 写入失败: HTTP {r.status} {await self._err_brief(r)}")
         except Exception as e:
             logger.error(f"❌ GitHub异常: {e}")
         return False

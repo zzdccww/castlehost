@@ -54,9 +54,8 @@ jobs:
             tail -n 50 singbox.log 2>/dev/null || true
             exit 1
           fi
-          # 出口 IP 与目标站连通性探测（诊断用，失败仅告警，最终结果由 renew.py 判定）
-          EGRESS_IP=$(curl -x http://127.0.0.1:8118 -sS --max-time 20 https://api.ipify.org || echo "N/A")
-          echo "egress IP via proxy: ${EGRESS_IP}"
+          # 目标站连通性探测（诊断用，失败仅告警，最终结果由 renew.py 判定）
+          # 不打印出口 IP：仓库公开时 Actions 日志同样公开，会暴露代理节点地址
           curl -x http://127.0.0.1:8118 -sS -o /dev/null -w "castle-host via-proxy HTTP=%{http_code}\n" \
             --max-time 25 https://cp.castle-host.com/servers || echo "经代理访问 castle-host 失败"
 
