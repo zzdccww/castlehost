@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时产物（截图含账号邮箱与服务器 IP，不要提交）
+.env
+castle_renew.log
+output/
+*.png
+
+# CI 生成物：sing-box 隧道
+config.json
+singbox.log
+sing-box
+sing-box-*/
+sing-box-*.tar.gz

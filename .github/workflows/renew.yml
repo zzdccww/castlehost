@@ -1,0 +1,98 @@
+name: Castle HOST 续约
+on:
+  schedule:
+    - cron: '45 3 * * *'  # 每天北京时间 11:45 运行
+  workflow_dispatch:      # 支持手动触发
+
+permissions:
+  actions: write   # 清理旧 workflow run 记录所需
+  contents: read
+
+jobs:
+  add_time:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright aiohttp pynacl
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Start Proxy Tunnel
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+        run: |
+          if [ -z "$PROXY_URL" ]; then
+            echo "PROXY_URL 未设置，跳过代理隧道，renew.py 直连出网"
+            exit 0
+          fi
+          SINGBOX_VER="1.11.0"
+          wget -q "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          tar -xzf "sing-box-${SINGBOX_VER}-linux-amd64.tar.gz"
+          mv "sing-box-${SINGBOX_VER}-linux-amd64/sing-box" ./sing-box
+          chmod +x ./sing-box
+          python3 proxy_handler.py
+          if [ ! -f config.json ]; then
+            echo "代理配置生成失败"
+            exit 1
+          fi
+          nohup ./sing-box run -c config.json > singbox.log 2>&1 &
+          sleep 5
+          # 隧道没起来就立即失败：否则浏览器指向死端口，每台服务器都会推一条"续约失败"通知
+          if ! pgrep -f "sing-box run" >/dev/null; then
+            echo "sing-box 启动失败"
+            tail -n 50 singbox.log 2>/dev/null || true
+            exit 1
+          fi
+          # 出口 IP 与目标站连通性探测（诊断用，失败仅告警，最终结果由 renew.py 判定）
+          EGRESS_IP=$(curl -x http://127.0.0.1:8118 -sS --max-time 20 https://api.ipify.org || echo "N/A")
+          echo "egress IP via proxy: ${EGRESS_IP}"
+          curl -x http://127.0.0.1:8118 -sS -o /dev/null -w "castle-host via-proxy HTTP=%{http_code}\n" \
+            --max-time 25 https://cp.castle-host.com/servers || echo "经代理访问 castle-host 失败"
+
+      - name: Run Castle-Host renewal script
+        env:
+          # Castle-Host 认证（必需）
+          CASTLE_COOKIES: ${{ secrets.CASTLE_COOKIES }}
+
+          # Telegram 通知（可选）
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+          # 回写轮换后的 cookie（可选，REPO_TOKEN 需具备 secrets 写权限）
+          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+          # 仅浏览器经代理出网，指向本地 sing-box mixed 入站。
+          # PROXY_URL 为空时此值为空串，renew.py 转 None 直连。
+          # Telegram / GitHub API 的 aiohttp 请求始终直连，不受代理影响。
+          CHROME_PROXY: ${{ secrets.PROXY_URL != '' && 'http://127.0.0.1:8118' || '' }}
+        run: python renew.py
+
+      - name: Stop Proxy Tunnel
+        if: always()
+        run: |
+          pkill -f "sing-box run" 2>/dev/null || true
+          if [ -f singbox.log ]; then
+            echo "--- singbox.log ---"
+            tail -n 200 singbox.log
+          fi
+
+      - name: 清理工作流记录
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 3
