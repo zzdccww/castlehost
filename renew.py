@@ -191,10 +191,12 @@ def join_cookies(pairs: Dict[str, str]) -> str:
     return "; ".join(f"{n}={pairs[n]}" for n in sorted(pairs))
 
 
-def parse_cookies(s: str) -> List[Dict]:
+def to_playwright_cookies(pairs: Dict[str, str]) -> List[Dict]:
+    """把 name -> value 映射转成 add_cookies 需要的形状。接收已解析的映射而不是原始串，
+    这样每个账号只解析一次，"丢弃瞬态 cookie" 的日志也只打一次。"""
     return [
         {"name": n, "value": v, "domain": ".castle-host.com", "path": "/"}
-        for n, v in cookie_pairs(s).items()
+        for n, v in pairs.items()
     ]
 
 
@@ -674,7 +676,8 @@ class CastleClient:
 
 async def process_account(cookie_str: str, idx: int, notifier: Notifier,
                           proxy: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], List[ServerResult]]:
-    cookies = parse_cookies(cookie_str)
+    pairs = cookie_pairs(cookie_str)
+    cookies = to_playwright_cookies(pairs)
     if not cookies:
         logger.error(f"❌ 账号#{idx + 1} Cookie解析失败")
         return None, []
@@ -755,7 +758,7 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier,
 
             new_cookie = await client.extract_cookies()
             # 与输入的规范化形式比较：只有值真的变了才回写，避免因为顺序或瞬态项反复改 secret
-            if new_cookie and new_cookie != join_cookies(cookie_pairs(cookie_str)):
+            if new_cookie and new_cookie != join_cookies(pairs):
                 logger.info(f"🔄 账号#{idx + 1} Cookie已变化")
                 return new_cookie, results
             return cookie_str, results

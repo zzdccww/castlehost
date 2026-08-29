@@ -26,7 +26,7 @@ CASTLE_COOKIES='PHPSESSID=xxx; uid=xxx' python renew.py
 
 PowerShell 下改用 `$env:CASTLE_COOKIES='...'; python renew.py`（注意用 `;` 而非 `&&`）。
 
-调试时把 `renew.py:599` 的 `headless=True` 改为 `False` 观察实际页面行为；日志同时写入 stdout 和 `castle_renew.log`，截图落在 `output/screenshots/`。
+调试时把 `renew.py:690` 的 `"headless": True` 改为 `False` 观察实际页面行为；日志同时写入 stdout 和 `castle_renew.log`，截图落在 `output/screenshots/`。
 
 `proxy_handler.py` 只用标准库，可单独验证解析结果（会在当前目录写出 `config.json`）：
 
