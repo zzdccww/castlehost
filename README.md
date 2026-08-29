@@ -64,6 +64,8 @@ Telegram 通知里的续约状态有四种：
 | 需人工过验证码 | 站点弹出 Cloudflare Turnstile | 要，见下文常见问题 |
 | 续约失败 | 余额不足、CSRF 校验失败或其他站点报错 | 要，看通知里的原文 |
 
+失败原文里出现「会话未携带 CSRF token」时，是页面没渲染出 token，基本等于 Cookie 已失效或会话被锁 —— 重新取一次 Cookie 更新 `CASTLE_COOKIES` 即可。
+
 续约状态下面还有一行运行状态，是每天强制停机之后最该先看的一行：
 
 | 运行状态 | 含义 | 要不要处理 |
@@ -82,6 +84,8 @@ Cookie 失效时不推续约结果，而是单独推一条"Cookie 已失效"并�
 ### Cookie 自动轮换
 
 站点会在访问过程中刷新 Cookie。配置 `REPO_TOKEN` 后，脚本每次跑完会把新 Cookie 加密（libsodium sealed box）回写到 `CASTLE_COOKIES`，省去手动更新。不配置也能跑，只是 Cookie 过期后要自己换。
+
+回写只保留 `PHPSESSID`、`uid`、`cookie_consent` 三项。DDoS-Guard 下发的 `__ddg*` 等临时 Cookie 与出口 IP、签发时刻绑定，站点每次访问都会重发，留着反而可能让请求被判成非法，所以一律丢弃。
 
 Actions 内置的 `GITHUB_TOKEN` 不具备改写 Secrets 的能力，只能自己签发一个 PAT。
 

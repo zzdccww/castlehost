@@ -68,11 +68,19 @@ DOM 只作为兜底：续约成功还会检查 `.iziToast-message:has-text("Ус
 - `"недостаточно"` → 余额不足
 - `"валидации"` → CSRF 校验失败
 
+**CSRF token 的注入链，动作前必须等它就绪。** 站点机制已实测确认：
+
+- 页面渲染 `<meta name="csrf-token" content="…">`，64 位十六进制，**同一会话内不随请求变化**（连续两次 GET `/servers` 拿到同一个值）。
+- 外部脚本 `castle.js` 顶层执行 `if (window.jQuery) $.ajaxSetup({beforeSend: xhr => { const token = getCsrfToken(); if (token) xhr.setRequestHeader('X-CSRF-Token', token); }})`，另外给 htmx 装 `htmx:configRequest` 钩子。**token 为空时不加这个头**。
+- 站点自己带 per-call `beforeSend` 的 `$.ajax`（如付款页禁用按钮那段）会手动调用 `$.ajaxSettings.beforeSend(arr, options)` 把头补回来 —— jQuery 里 per-call `beforeSend` 覆盖而非追加。
+
+`window.ServersID`、`freePay` 是内联的，`castle.js` 是外链的：只等内联信号就触发动作，可能赶在 `castle.js` 执行之前，请求不带 token，站点对**所有** POST 一律回 `Ошибка валидации запроса!`（GET 不校验，所以页面照样能读）。因此 `goto_servers()`、`renew()` 点击前、`ensure_running()` 下指令前都要过 `wait_csrf_ready()`（等 `jQuery.ajaxSettings.beforeSend` 已是函数且 meta token 非空）。等不到就直接报"会话未携带 CSRF token"，不再发注定失败的请求。`log_request_csrf()` 在响应回来时记 HTTP 状态和 `X-CSRF-Token` 长度（只记长度，绝不打印 token），用来区分"没带头"和"带了但站点不认"。
+
 **站点 2026 年改版新增的三道反自动化设施**（改动前必读）：
 
 1. **Cloudflare Turnstile 会话闸门。** 任意 AJAX 都可能返回 `{"status":"captcha_required"}`，页面用 `$(document).ajaxComplete` 全局钩子捕获后弹出 `#validateModal` 并渲染 `#cf-turnstile-validate`，人工过验证后 POST `/main/index/unlock/` 解锁会话。另有 `/main/index/getstatus/online` 每 60 秒轮询同一状态。脚本无法自动破解，只能识别并上报 `RenewalStatus.CAPTCHA_REQUIRED`，等人工登录处理。
 2. **付款页 Turnstile 开关。** 付款页服务端渲染 `const showCaptcha = true|false`。为 `true` 时 `freePay()` 会先取 `turnstile.getResponse('#cf-turnstile-pay')`，取不到就只弹 toast 而**不发请求** —— 此时点击 `#freebtn` 拿不到任何响应。`renew()` 因此在点击前先正则匹配这个标志位，避免误报"无响应"。
-3. **cookie 同意横幅。** `cookie_consent` cookie 缺失时渲染，会遮挡 `#freebtn`。`parse_cookies()` 自动补 `cookie_consent=accepted`，`dismiss_cookie_banner()` 再兜底点 `#cookieAcceptAll`。
+3. **cookie 同意横幅。** `cookie_consent` cookie 缺失时渲染，会遮挡 `#freebtn`。`cookie_pairs()` 自动补 `cookie_consent=accepted`，`dismiss_cookie_banner()` 再兜底点 `#cookieAcceptAll`。
 
 站点同时在 DDoS-Guard 之后（`__ddg8_/9_/10_` cookie），无头环境有被质询的可能。
 
@@ -93,6 +101,8 @@ DOM 只作为兜底：续约成功还会检查 `.iziToast-message:has-text("Ус
 **不要用 `wait_until="networkidle"`。** 页面有 60 秒周期轮询 + Turnstile/统计脚本，networkidle 可能等不到。统一改为 `domcontentloaded` 加具体就绪条件（`/servers` 等 `Array.isArray(window.ServersID)`，付款页等 `typeof window.freePay === 'function'`）。
 
 **Cookie 自动轮换。** 每个账号跑完后 `extract_cookies()` 从 BrowserContext 取回最新 cookie；若与输入不同，`GitHubManager.update_secret()` 用 libsodium sealed box（pynacl）加密后 PUT 回 `CASTLE_COOKIES` secret。注意所有账号的新 cookie 会重新拼成一个逗号串整体覆盖，单账号失败时（返回 `None`）会保留原值以免污染其他账号。
+
+**只有 `PERSISTENT_COOKIE_NAMES` 里的 cookie 跨运行保留**（`PHPSESSID` / `uid` / `cookie_consent`）。`cookie_pairs()` 在解析输入时就丢掉其余项，`extract_cookies()` 回写时同样只留这三个。原因是 DDoS-Guard 的 `__ddg*` 与出口 IP、签发时刻绑定，站点每次访问都会重发，把上一次运行的旧值再喂回去只会带来风险；写回的串按名字排序（`join_cookies()`），因此"有没有变化"的比较只反映值的变化，不受 cookie jar 返回顺序影响。同名 cookie 可能同时存在 `.castle-host.com`（我们注入的）和 `cp.castle-host.com`（站点下发的）两份，取回时让 host-only 那份覆盖 —— 那才是站点当前认的值。
 
 **每账号独立浏览器实例。** `process_account()` 内部各自 `async_playwright()` 启动/关闭浏览器，账号之间 sleep 5 秒，账号处理串行不并发。
 

@@ -32,6 +32,11 @@ OUTPUT_DIR = Path("output/screenshots")
 CONSENT_COOKIE_NAME = "cookie_consent"
 CONSENT_COOKIE_VALUE = "accepted"
 
+# 只有这三个 cookie 值得跨运行保留：前两个是账号凭据，第三个用来压掉同意横幅。
+# 其余（尤其是 DDoS-Guard 的 __ddg*）与出口 IP 和签发时刻绑定，站点每次访问都会重发；
+# 把上一次运行留下的旧值再喂回去，GET 仍能通过，但会话相关的 POST 可能被判成非法请求。
+PERSISTENT_COOKIE_NAMES = ("PHPSESSID", "uid", CONSENT_COOKIE_NAME)
+
 # Windows 控制台默认 GBK，日志里的 emoji 会抛 UnicodeEncodeError（CI 的 Linux 是 UTF-8，不受影响）。
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -154,22 +159,43 @@ def parse_expiry(text: str) -> Tuple[str, int]:
     return expiry, days
 
 
-def parse_cookies(s: str) -> List[Dict]:
-    cookies = []
-    names = set()
+def cookie_pairs(s: str) -> Dict[str, str]:
+    """把一个账号的 cookie 串解析成 name -> value。
+
+    同名 cookie 只保留最后一次出现：浏览器 cookie jar 本来就以 name+domain+path 为键，
+    这里显式去重是为了让"保留哪一个"变成确定行为，而不是取决于 add_cookies 的顺序。
+    不在白名单里的 cookie（如 __ddg*）一律丢弃，交给站点当场重新签发。
+    """
+    seen: Dict[str, str] = {}
+    dropped = 0
     for p in s.split(";"):
         p = p.strip()
-        if "=" in p:
-            n, v = p.split("=", 1)
-            n = n.strip()
-            names.add(n)
-            cookies.append({"name": n, "value": v.strip(), "domain": ".castle-host.com", "path": "/"})
-    if cookies and CONSENT_COOKIE_NAME not in names:
-        cookies.append({
-            "name": CONSENT_COOKIE_NAME, "value": CONSENT_COOKIE_VALUE,
-            "domain": ".castle-host.com", "path": "/"
-        })
-    return cookies
+        if "=" not in p:
+            continue
+        n, v = p.split("=", 1)
+        n = n.strip()
+        if n not in PERSISTENT_COOKIE_NAMES:
+            dropped += 1
+            continue
+        seen[n] = v.strip()
+    if seen and CONSENT_COOKIE_NAME not in seen:
+        seen[CONSENT_COOKIE_NAME] = CONSENT_COOKIE_VALUE
+    if dropped:
+        logger.info(f"🍪 已丢弃 {dropped} 个瞬态 cookie，由站点重新签发")
+    return seen
+
+
+def join_cookies(pairs: Dict[str, str]) -> str:
+    """按名字排序拼回 cookie 串。排序是为了让回写前的"有没有变化"比较只反映值的变化，
+    不受 cookie jar 返回顺序影响。"""
+    return "; ".join(f"{n}={pairs[n]}" for n in sorted(pairs))
+
+
+def parse_cookies(s: str) -> List[Dict]:
+    return [
+        {"name": n, "value": v, "domain": ".castle-host.com", "path": "/"}
+        for n, v in cookie_pairs(s).items()
+    ]
 
 
 def build_proxy(raw: str) -> Optional[Dict[str, str]]:
@@ -330,6 +356,45 @@ class CastleClient:
         except Exception:
             return False
 
+    # castle.js（外部脚本）用 $.ajaxSetup({beforeSend}) 给所有 jQuery AJAX 加 X-CSRF-Token，
+    # token 取自 meta[name="csrf-token"]，且只在非空时才加这个头；
+    # 而 window.ServersID、freePay 是内联的：只等内联信号就动手，可能赶在 castle.js 执行前，
+    # 此时请求不带 token，站点一律回 "Ошибка валидации запроса!"。
+    CSRF_READY = (
+        "!!(window.jQuery && jQuery.ajaxSettings"
+        " && typeof jQuery.ajaxSettings.beforeSend === 'function'"
+        " && (document.querySelector('meta[name=\"csrf-token\"]') || {}).content)"
+    )
+
+    async def wait_csrf_ready(self) -> bool:
+        """等 CSRF 注入链就绪。任何状态变更请求之前都必须先过这一关。"""
+        try:
+            await self.page.wait_for_function(self.CSRF_READY, timeout=20000)
+            return True
+        except Exception:
+            meta_len = await self.page.evaluate(
+                "((document.querySelector('meta[name=\"csrf-token\"]') || {}).content || '').length"
+            )
+            has_hook = await self.page.evaluate(
+                "!!(window.jQuery && jQuery.ajaxSettings"
+                " && typeof jQuery.ajaxSettings.beforeSend === 'function')"
+            )
+            # 只记长度和布尔值，绝不打印 token 本身
+            logger.warning(f"⚠️ CSRF 注入链未就绪: meta长度={meta_len} 全局beforeSend={has_hook}")
+            return False
+
+    async def log_request_csrf(self, response) -> None:
+        """状态变更请求被拒时，需要能区分"没带 token"和"带了但站点不认"。"""
+        try:
+            headers = await response.request.all_headers()
+            token = headers.get("x-csrf-token", "")
+            logger.info(
+                f"🔎 请求诊断: HTTP={response.status} "
+                f"X-CSRF-Token长度={len(token)} 闸门={await self.captcha_gate_active()}"
+            )
+        except Exception:
+            pass
+
     async def goto_servers(self):
         # 页面每 60 秒轮询 /main/index/getstatus/online，networkidle 可能迟迟等不到，
         # 改为等具体就绪信号（ServersID 已定义）。
@@ -338,6 +403,7 @@ class CastleClient:
             await self.page.wait_for_function("Array.isArray(window.ServersID)", timeout=15000)
         except Exception:
             await self.page.wait_for_timeout(2000)
+        await self.wait_csrf_ready()
         await self.dismiss_cookie_banner()
 
     async def get_server_ids(self) -> List[str]:
@@ -425,10 +491,13 @@ class CastleClient:
                     if data is not None:
                         response_data['result'] = data
                         logger.info(f"📡 启动API响应: {data}")
+                        await self.log_request_csrf(response)
 
             self.page.on("response", handle_response)
             try:
                 logger.info("🔄 发送启动指令...")
+                if not await self.wait_csrf_ready():
+                    return StartStatus.FAILED, "会话未携带 CSRF token（Cookie 可能已失效）"
                 if not await self._dispatch_action(sid, 'start'):
                     logger.warning("⚠️ 页面未导出 sendAction/sendActionStatus，回退为点击按钮")
                     await self.page.locator(f'[onclick*="{sid}"][onclick*="start"]').first.click()
@@ -473,6 +542,7 @@ class CastleClient:
                 await self.page.wait_for_function("typeof window.freePay === 'function'", timeout=15000)
             except Exception:
                 await self.page.wait_for_timeout(2000)
+            await self.wait_csrf_ready()
             await self.dismiss_cookie_banner()
 
             content = await self.page.text_content("body")
@@ -501,6 +571,13 @@ class CastleClient:
                 screenshot_file = await self.take_screenshot(sid, "no_button")
                 return RenewalStatus.FAILED, "找不到续约按钮", screenshot_file, expiry, days
 
+            # castle.js 的 $.ajaxSetup(beforeSend) 只在 token 非空时才加 X-CSRF-Token 头，
+            # token 缺失时点下去必然换回"请求校验失败"，不如直接报会话问题。
+            if not await self.wait_csrf_ready():
+                screenshot_file = await self.take_screenshot(sid, "no_csrf")
+                return (RenewalStatus.FAILED, "会话未携带 CSRF token（Cookie 可能已失效）",
+                        screenshot_file, expiry, days)
+
             response_data = {}
 
             async def handle_response(response):
@@ -508,6 +585,7 @@ class CastleClient:
                     data = await read_json_response(response)
                     if data is not None:
                         response_data['result'] = data
+                        await self.log_request_csrf(response)
 
             self.page.on("response", handle_response)
             try:
@@ -577,10 +655,20 @@ class CastleClient:
             return RenewalStatus.FAILED, str(e), screenshot_file, expiry, days
 
     async def extract_cookies(self) -> Optional[str]:
+        """只取回值得跨运行保留的 cookie。DDoS-Guard 的 __ddg* 等瞬态项不回写：
+        它们与出口 IP、签发时刻绑定，下次运行重放旧值可能让 POST 被判成非法请求。
+
+        同名 cookie 可能同时存在两份：我们注入的 .castle-host.com 和站点自己下发的
+        cp.castle-host.com。后者才是站点当前认的值，所以让 host-only 的那份覆盖。"""
         try:
-            cc = [c for c in await self.ctx.cookies() if "castle-host.com" in c.get("domain", "")]
-            return "; ".join([f"{c['name']}={c['value']}" for c in cc]) if cc else None
-        except:
+            cc = [
+                c for c in await self.ctx.cookies()
+                if "castle-host.com" in c.get("domain", "") and c["name"] in PERSISTENT_COOKIE_NAMES
+            ]
+            cc.sort(key=lambda c: c.get("domain", "").startswith("."), reverse=True)
+            pairs = {c["name"]: c["value"] for c in cc}
+            return join_cookies(pairs) if pairs else None
+        except Exception:
             return None
 
 
@@ -666,7 +754,8 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier,
                 await notifier.send_photo(caption, r.screenshot)
 
             new_cookie = await client.extract_cookies()
-            if new_cookie and new_cookie != cookie_str:
+            # 与输入的规范化形式比较：只有值真的变了才回写，避免因为顺序或瞬态项反复改 secret
+            if new_cookie and new_cookie != join_cookies(cookie_pairs(cookie_str)):
                 logger.info(f"🔄 账号#{idx + 1} Cookie已变化")
                 return new_cookie, results
             return cookie_str, results
