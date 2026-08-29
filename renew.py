@@ -51,6 +51,17 @@ class RenewalStatus(Enum):
     CAPTCHA_REQUIRED = "captcha_required"
 
 
+class StartStatus(Enum):
+    """服务器运行状态的最终判定。站点每天 0-1 点（莫斯科时间）强停免费服务器，
+    启动失败必须能在通知里看到，不能被"续约成功"掩盖。"""
+    RUNNING = "running"    # 本来就在运行，无需启动
+    STARTED = "started"    # 本次下达启动指令并已确认运行
+    STOPPED = "stopped"    # 启动指令已发出，面板仍显示关机
+    FAILED = "failed"      # 启动指令被站点拒绝或无响应
+    CAPTCHA = "captcha"    # 被 Turnstile 闸门拦截
+    UNKNOWN = "unknown"    # 运行状态判定失败
+
+
 @dataclass
 class ServerResult:
     server_id: str
@@ -58,7 +69,8 @@ class ServerResult:
     message: str
     expiry: str = ""
     days: int = 0
-    started: bool = False
+    start: StartStatus = StartStatus.UNKNOWN
+    start_msg: str = ""
     screenshot: str = ""
 
 
@@ -99,6 +111,21 @@ def screenshot_path(account_idx: int, server_id: str, stage: str) -> str:
 
 def mask_id(sid: str) -> str:
     return f"{sid[0]}***{sid[-2:]}" if len(sid) > 3 else "***"
+
+
+def start_line(status: StartStatus, msg: str) -> str:
+    """把运行状态渲染成通知里的一行。每日强停后"服务器有没有起来"比续约结果更需要人第一眼看到。"""
+    if status is StartStatus.STARTED:
+        return "🟢 已启动服务器\n"
+    if status is StartStatus.RUNNING:
+        return "🟢 服务器运行中\n"
+    if status is StartStatus.STOPPED:
+        return "🟡 启动指令已发出，面板仍显示关机\n"
+    if status is StartStatus.CAPTCHA:
+        return f"🤖 启动被验证码拦截: {msg}\n"
+    if status is StartStatus.UNKNOWN:
+        return "⚠️ 运行状态未确认\n"
+    return f"🔴 服务器未能启动: {msg}\n"
 
 
 def convert_date(s: str) -> str:
@@ -337,9 +364,10 @@ class CastleClient:
             logger.error(f"❌ 获取服务器ID失败: {e}")
         return []
 
-    async def check_server_stopped(self, sid: str) -> bool:
+    async def check_server_stopped(self, sid: str) -> Optional[bool]:
         """关机时控制区渲染 start 按钮，运行时渲染 stop（icon-server-bwork）。
-        只按 onclick 判断，不依赖图标 class，避免站点换类名后再次失效。"""
+        只按 onclick 判断，不依赖图标 class，避免站点换类名后再次失效。
+        判定失败返回 None，不能当成"在运行"——那样每日强停后会静默跳过启动。"""
         try:
             return await self.page.evaluate(
                 """(sid) => [...document.querySelectorAll('[onclick]')].some(e => {
@@ -348,8 +376,9 @@ class CastleClient:
                 })""",
                 sid
             )
-        except Exception:
-            return False
+        except Exception as e:
+            logger.warning(f"⚠️ 服务器 {mask_id(sid)} 运行状态判定失败: {e}")
+            return None
 
     async def _dispatch_action(self, sid: str, action: str) -> bool:
         """/servers 导出 sendAction，服务器详情页导出 sendActionStatus，签名一致。
@@ -365,16 +394,26 @@ class CastleClient:
         await self.page.evaluate(f"{fn}({sid}, '{action}')")
         return True
 
-    async def start_server_via_api(self, sid: str) -> bool:
-        """通过调用页面 JS 函数启动服务器"""
+    async def ensure_running(self, sid: str, allow_start: bool = True) -> Tuple[StartStatus, str]:
+        """确认服务器在运行，必要时调用页面 JS 函数启动。
+
+        站点每天 0-1 点（莫斯科时间）强停免费服务器，所以这是每次运行的主要目的之一。
+        续约前后各调用一次：前一次负责拉起，后一次负责复核。allow_start=False 用于复核，
+        避免对同一台机器重复下启动指令。"""
         masked = mask_id(sid)
         try:
             if "/servers" not in self.page.url or "/control" in self.page.url or "/pay" in self.page.url:
                 await self.goto_servers()
 
-            if not await self.check_server_stopped(sid):
-                logger.info(f"✅ 服务器 {masked} 已在运行")
-                return False
+            stopped = await self.check_server_stopped(sid)
+            if stopped is None:
+                return StartStatus.UNKNOWN, "运行状态判定失败"
+            if not stopped:
+                logger.info(f"✅ 服务器 {masked} 运行中")
+                return StartStatus.RUNNING, ""
+            if not allow_start:
+                logger.warning(f"🟡 服务器 {masked} 启动指令已发出，面板仍显示关机")
+                return StartStatus.STOPPED, "启动指令已发出，面板仍显示关机"
 
             logger.info(f"🔴 服务器 {masked} 已关机，正在启动...")
 
@@ -401,21 +440,23 @@ class CastleClient:
             status = result.get('status')
 
             if status == 'captcha_required':
-                logger.warning(f"🤖 启动被验证码闸门拦截: {result.get('error', '')}")
-                return False
+                err = result.get('error', '') or "需人工过验证码"
+                logger.warning(f"🤖 启动被验证码闸门拦截: {err}")
+                return StartStatus.CAPTCHA, err
             if status == 'success':
-                logger.info(f"🟢 服务器 {masked} 启动成功")
+                logger.info(f"🟢 服务器 {masked} 启动指令已接受")
                 await self.page.wait_for_timeout(3000)
                 await self.goto_servers()
-                return True
+                return StartStatus.STARTED, ""
             if status == 'error':
-                logger.warning(f"⚠️ 启动失败: {result.get('error', '未知错误')}")
-                return False
+                err = result.get('error', '未知错误')
+                logger.warning(f"⚠️ 启动失败: {err}")
+                return StartStatus.FAILED, err
             logger.warning("⚠️ 启动响应未知")
-            return False
+            return StartStatus.FAILED, "启动指令无响应"
         except Exception as e:
             logger.error(f"❌ 启动服务器 {masked} 失败: {e}")
-        return False
+            return StartStatus.FAILED, str(e)
 
     async def renew(self, sid: str) -> Tuple[RenewalStatus, str, str, str, int]:
         """续约服务器"""
@@ -587,14 +628,19 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier,
                 masked = mask_id(sid)
                 logger.info(f"--- 处理服务器 {masked} ---")
 
-                started = await client.start_server_via_api(sid)
+                pre, _ = await client.ensure_running(sid)
 
                 status, msg, screenshot, expiry, days = await client.renew(sid)
 
-                results.append(ServerResult(sid, status, msg, expiry, days, started, screenshot))
+                # 续约后复核：启动指令到面板状态刷新有延迟；若续约前因过期启动被拒，
+                # 此时可再试一次（allow_start 只在前一次没成功时打开，避免重复下指令）。
+                start, start_msg = await client.ensure_running(
+                    sid, allow_start=pre is not StartStatus.STARTED
+                )
+                if start is StartStatus.RUNNING and pre is StartStatus.STARTED:
+                    start, start_msg = StartStatus.STARTED, ""
 
-                if len(server_ids) > 1 and sid != server_ids[-1]:
-                    await client.goto_servers()
+                results.append(ServerResult(sid, status, msg, expiry, days, start, start_msg, screenshot))
 
             for r in results:
                 if r.status == RenewalStatus.SUCCESS:
@@ -606,7 +652,6 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier,
                 else:
                     status_icon, status_text = "❌", f"续约失败: {r.message}"
 
-                started_line = "🟢 服务器已启动\n" if r.started else ""
                 masked_id = mask_id(r.server_id)
                 caption = (
                     f"🖥️ Castle-Host 自动续约\n\n"
@@ -615,7 +660,7 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier,
                     f"💻 服务器: {masked_id}\n"
                     f"📅 到期: {convert_date(r.expiry)}\n"
                     f"⏳ 剩余: {r.days} 天\n"
-                    f"{started_line}\n"
+                    f"{start_line(r.start, r.start_msg)}\n"
                     f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 )
                 await notifier.send_photo(caption, r.screenshot)

@@ -26,7 +26,7 @@ CASTLE_COOKIES='PHPSESSID=xxx; uid=xxx' python renew.py
 
 PowerShell 下改用 `$env:CASTLE_COOKIES='...'; python renew.py`（注意用 `;` 而非 `&&`）。
 
-调试时把 `renew.py:547` 的 `headless=True` 改为 `False` 观察实际页面行为；日志同时写入 stdout 和 `castle_renew.log`，截图落在 `output/screenshots/`。
+调试时把 `renew.py:599` 的 `headless=True` 改为 `False` 观察实际页面行为；日志同时写入 stdout 和 `castle_renew.log`，截图落在 `output/screenshots/`。
 
 `proxy_handler.py` 只用标准库，可单独验证解析结果（会在当前目录写出 `config.json`）：
 
@@ -47,7 +47,7 @@ PROXY_URL='vless://uuid@host:443?security=tls&type=ws&path=/ws' python proxy_han
 
 ## 架构要点
 
-**结果判定依赖网络响应拦截，而非 DOM 解析。** 这是全脚本最关键的设计。`renew()` 和 `start_server_via_api()` 都先注册 `page.on("response", handler)` 捕获目标接口的 JSON，再触发动作，`wait_for_timeout` 等待后 `remove_listener` 并读取捕获结果。修改这两个方法时必须保持"注册监听 → 触发 → 等待 → 移除监听"的顺序，否则会丢响应或泄漏监听器。
+**结果判定依赖网络响应拦截，而非 DOM 解析。** 这是全脚本最关键的设计。`renew()` 和 `ensure_running()` 都先注册 `page.on("response", handler)` 捕获目标接口的 JSON，再触发动作，`wait_for_timeout` 等待后 `remove_listener` 并读取捕获结果。修改这两个方法时必须保持"注册监听 → 触发 → 等待 → 移除监听"的顺序，否则会丢响应或泄漏监听器。
 
 关注的接口：
 - `/servers/pay/buy_months/` — 续约结果
@@ -57,7 +57,11 @@ DOM 只作为兜底：续约成功还会检查 `.iziToast-message:has-text("Ус
 
 **服务器 ID 动态发现。** `get_server_ids()` 用正则从 `/servers` 页面 HTML 提取 `var ServersID = [...]`，不硬编码 ID；取不到再依次回退 `window.ServersID` 和页面链接里的数字 ID。workflow 因此不需要任何 `SERVER_ID` 配置。
 
-**直接调用页面内 JS 函数。** 开机走 `page.evaluate(f"sendAction({sid}, 'start')")`，而不是点按钮或自行构造 HTTP 请求 —— 这样能复用站点自身的 CSRF token 逻辑。关机状态通过定位 `button.icon-server-bstop[onclick*="sendAction({sid},'start')"]` 判断。续约点击的是 `#freebtn`。
+**开机是与续约并列的目的，不是附带动作。** 站点每天莫斯科时间 0-1 点强制停掉免费服务器，所以 workflow 定在 `cron: '10 22 * * *'`（UTC）= 莫斯科时间 01:10 = 北京时间 06:10，压在停机窗口结束后 10 分钟。GitHub 排队延迟只会让开机稍晚，不会把运行时刻推回停机窗口内。改时间前先换算 UTC，Actions 的 cron 只认 UTC。
+
+`process_account()` 的每台服务器循环里 `ensure_running()` 调用两次：续约前负责拉起，续约后负责复核（`allow_start=pre is not StartStatus.STARTED`，前一次已成功下指令就不再重复下）。第二次调用同时覆盖两种情况 —— 启动指令到面板状态刷新的延迟，以及"续约前因过期开不了机、续约后才能开"。返回值折叠成一个 `StartStatus` 存进 `ServerResult.start`，由 `start_line()` 渲染成通知里的一行：启动失败必须可见，不能只显示"续约成功"让人误以为服务器活着。
+
+**直接调用页面内 JS 函数。** 开机走 `page.evaluate(f"sendAction({sid}, 'start')")`，而不是点按钮或自行构造 HTTP 请求 —— 这样能复用站点自身的 CSRF token 逻辑；页面没导出函数时才回退到点 `[onclick*="{sid}"][onclick*="start"]`。关机状态由 `check_server_stopped()` 扫描所有 `[onclick]` 属性里是否存在 `(sid,'start'` 判断，不依赖图标 class。该方法返回 `Optional[bool]`，**判定失败返回 `None` 而非 `False`** —— 把未知当成"在运行"会让每日强停后静默跳过启动，这是设计上刻意区分的。续约点击的是 `#freebtn`。
 
 **错误分类匹配俄语字符串。** `renew()` 中对 `error` 文本的判断依赖俄语子串，不要改成英文：
 - `"24 час"` / `"продлен"` → 24 小时限流（`RATE_LIMITED`，属正常结果非失败）
