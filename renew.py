@@ -585,7 +585,10 @@ class CastleClient:
         # extract_cookies() 只回收站点当前认的项，cookie_consent 可能已被站点清掉。
         # 交给 UC 会话前用 cookie_pairs() 补回默认值，否则同意横幅会盖住 #freebtn。
         # 这里复用同一个解析函数而不另写一份：输入已无瞬态项，不会重复打"已丢弃"日志。
-        cookie_str = join_cookies(cookie_pairs(cookie_str))
+        uc_pairs = cookie_pairs(cookie_str)
+        # 只打名字不打值。缺 PHPSESSID 就意味着 UC 会话是未登录态，值得当场看见
+        logger.info(f"🍪 交给 UC 会话的 cookie: {','.join(sorted(uc_pairs))}")
+        cookie_str = join_cookies(uc_pairs)
         if not SB_PAY_SCRIPT.exists():
             logger.error(f"❌ 找不到 {SB_PAY_SCRIPT.name}")
             return fallback

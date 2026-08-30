@@ -24,6 +24,7 @@ import json
 import time
 import argparse
 from typing import Dict, Optional
+from urllib.parse import urlparse
 
 BASE = "https://cp.castle-host.com"
 COOKIE_ENV = "CASTLE_UC_COOKIES"
@@ -164,15 +165,25 @@ def parse_cookie_env(raw: str) -> Dict[str, str]:
     return pairs
 
 
-def js(sb, script):
+def js(sb, script, label: str = ""):
+    """执行一段 JS 表达式并取回值。
+
+    必须补 return：Selenium 把脚本当成一个匿名函数的函数体执行，只有 return 出来的值才会
+    回传。本模块（以及被参考的 katabump）的片段都写成 `(function(){...})()` 形式，直接交给
+    execute_script 会一律拿到 None —— 不报错，所以最难查：solved() 永远为假，六轮点击注定
+    白跑，toast 也永远读成空串。本地用 selenium 4.41 实测确认过这个差别。
+
+    异常同样要打出来，吞掉只会把故障伪装成"验证码没过"。
+    """
     try:
-        return sb.execute_script(script)
-    except Exception:
+        return sb.execute_script("return " + script.strip())
+    except Exception as e:
+        log(f"JS 执行失败{'（' + label + '）' if label else ''}: {e}")
         return None
 
 
 def solved(sb) -> bool:
-    return bool(js(sb, _SOLVED_JS))
+    return bool(js(sb, _SOLVED_JS, "solved"))
 
 
 def click_captcha(sb) -> str:
@@ -205,18 +216,18 @@ def handle_pay_turnstile(sb) -> bool:
 
     expanded = None
     for _ in range(3):
-        expanded = js(sb, _EXPAND_JS)
+        expanded = js(sb, _EXPAND_JS, "expand")
         time.sleep(0.5)
     # 'no-turnstile' 表示控件根本没渲染，与"渲染了但点不中"是两种完全不同的故障
     log(f"解除裁剪: {expanded}")
-    log(f"诊断: {js(sb, _DIAG_JS)}")
+    log(f"诊断: {js(sb, _DIAG_JS, 'diag')}")
 
     for attempt in range(1, SOLVE_ROUNDS + 1):
         if solved(sb):
             log(f"turnstile 已通过（第 {attempt - 1} 轮后）")
             return True
         # 每轮都重新滚：点击、页面自身的重排都可能把控件再挪出视口
-        log(f"第 {attempt}/{SOLVE_ROUNDS} 轮 滚动 {js(sb, _SCROLL_JS)}")
+        log(f"第 {attempt}/{SOLVE_ROUNDS} 轮 滚动 {js(sb, _SCROLL_JS, 'scroll')}")
         log(f"  点击 -> {click_captcha(sb)}")
         for _ in range(POLL_SECONDS * 2):
             time.sleep(0.5)
@@ -225,7 +236,7 @@ def handle_pay_turnstile(sb) -> bool:
                 return True
 
     log(f"turnstile {SOLVE_ROUNDS} 轮均未通过")
-    log(f"收尾诊断: {js(sb, _DIAG_JS)}")
+    log(f"收尾诊断: {js(sb, _DIAG_JS, 'diag')}")
     return False
 
 
@@ -237,7 +248,7 @@ def toast_text(sb) -> str:
         Array.from(document.querySelectorAll('.iziToast-message'))
             .map(function(e){ return (e.textContent || '').trim(); })
             .filter(Boolean).join(' | ')
-    """) or ""
+    """, "toast") or ""
 
 
 def collect_cookies(sb) -> Dict[str, str]:
@@ -279,6 +290,11 @@ def run(sid: str, masked: str, shot: str) -> Dict:
         log("未取到可用 cookie")
         result["toast"] = "UC 旁路未取到 cookie"
         return result
+    # 没有 PHPSESSID 就不可能是登录态，付款页会被重定向到登录页，六轮点击必然白跑
+    if "PHPSESSID" not in pairs:
+        log(f"cookie 里没有 PHPSESSID（只有 {','.join(sorted(pairs))}）")
+        result["toast"] = "UC 旁路未取到会话 cookie"
+        return result
 
     kwargs = {"uc": True, "headless": False}   # UC 模式在 headless 下可被检测，显示由 xvfb 提供
     proxy = norm_proxy(os.environ.get(PROXY_ENV, ""))
@@ -304,8 +320,10 @@ def run(sid: str, masked: str, shot: str) -> Dict:
         # 只打名字不打值。缺 cookie_consent 时同意横幅会盖住 #freebtn，这里要看得出来
         log(f"已注入 cookie: {','.join(sorted(pairs))}，打开服务器 {masked} 的付款页")
         sb.uc_open_with_reconnect(pay_url, RECONNECT)
-        # 不打印完整 URL：尾段就是服务器 ID。只看有没有被挑战页顶掉
-        log(f"付款页已加载: {'/servers/pay/' in (sb.get_current_url() or '')}")
+        # 比对 path 而不是子串：重定向到 /login?back=/servers/pay/... 时子串一样会命中，
+        # 那正是"没登录"的样子，不能被判成加载成功。
+        landed = urlparse(sb.get_current_url() or "").path
+        log(f"付款页已加载: {landed.startswith('/servers/pay/')}")
 
         # cookie_consent 已随 cookie 注入，横幅通常不出现；出现了就点掉，否则会遮挡 #freebtn
         try:
