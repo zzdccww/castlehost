@@ -37,6 +37,17 @@ CONSENT_COOKIE_VALUE = "accepted"
 # 把上一次运行留下的旧值再喂回去，GET 仍能通过，但会话相关的 POST 可能被判成非法请求。
 PERSISTENT_COOKIE_NAMES = ("PHPSESSID", "uid", CONSENT_COOKIE_NAME)
 
+# 付款页开启 Turnstile 时的旁路：sb_pay.py 以子进程运行 SeleniumBase UC 模式，用真实鼠标过验证。
+# 单独进程而不是 import，是因为 SeleniumBase 同步阻塞、pyautogui 又要求有显示，
+# 隔离开来卡死或崩溃都不会带走主脚本，超时由这里兜住。
+SB_PAY_SCRIPT = Path(__file__).with_name("sb_pay.py")
+SB_PAY_TIMEOUT = 300          # 最坏情况：启动浏览器 + 6 轮点击各等 8 秒 + 两次导航
+SB_PAY_COOKIE_ENV = "CASTLE_UC_COOKIES"
+SB_PAY_PROXY_ENV = "CASTLE_UC_PROXY"
+# 站点当前 showCaptcha 为假，这条旁路平时走不到。置 1 可强制走一次，用来验证整链是否通。
+FORCE_SB_PAY = os.environ.get("CASTLE_FORCE_SB_PAY", "").strip() == "1"
+
+
 # Windows 控制台默认 GBK，日志里的 emoji 会抛 UnicodeEncodeError（CI 的 Linux 是 UTF-8，不受影响）。
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -157,6 +168,26 @@ def parse_expiry(text: str) -> Tuple[str, int]:
     md = re.search(r"Оставшийся\s+срок\s+аренды[^\d]{0,20}(\d+)", text)
     days = int(md.group(1)) if md else days_left(expiry)
     return expiry, days
+
+
+def classify_renew_error(error_msg: str) -> Tuple[RenewalStatus, str]:
+    """把站点返回的俄语报错归类。两条续约路径（Playwright 主路径读接口 JSON，UC 旁路读 toast）
+    共用这一份规则，避免同一批俄语子串出现两处、改一处漏一处。
+
+    判断依赖俄语子串，不要改成英文：站点只发俄语。
+    """
+    m = (error_msg or "").lower()
+    if not m:
+        return RenewalStatus.FAILED, "未知错误"
+    # "уже продлен" 可能被站点改写为 "уже был продлен" 等变体，只匹配词干更稳
+    if "24 час" in m or "продлен" in m:
+        return RenewalStatus.RATE_LIMITED, "今日已续期(24小时限制)"
+    if "недостаточно" in m:
+        return RenewalStatus.FAILED, "余额不足"
+    if "валидации" in m:
+        return RenewalStatus.FAILED, "CSRF验证失败"
+    return RenewalStatus.FAILED, error_msg
+
 
 
 def cookie_pairs(s: str) -> Dict[str, str]:
@@ -329,6 +360,10 @@ class CastleClient:
     def __init__(self, ctx: BrowserContext, page: Page, account_idx: int):
         self.ctx, self.page = ctx, page
         self.account_idx = account_idx
+        # UC 旁路跑完回收的 cookie。非空时优先于 Playwright 侧的副本用于回写：
+        # 旁路里那个会话才是站点最后认的。
+        self.uc_cookies: Dict[str, str] = {}
+
 
     async def take_screenshot(self, server_id: str, stage: str) -> str:
         try:
@@ -529,8 +564,120 @@ class CastleClient:
             logger.error(f"❌ 启动服务器 {masked} 失败: {e}")
             return StartStatus.FAILED, str(e)
 
+    async def _renew_via_uc(self, sid: str, expiry: str,
+                            days: int) -> Tuple[RenewalStatus, str, str, str, int]:
+        """付款页开启 Turnstile 时的旁路：交给 sb_pay.py 子进程用 UC 模式过验证并点续约。
+
+        Playwright 过不了 Turnstile（连接常驻、navigator.webdriver 为真、CDP 可探测），
+        UC 模式靠点击瞬间断开 webdriver + 操作系统鼠标才能过，两者不能混在一个浏览器里。
+
+        任何一步不成都退回今天的 CAPTCHA_REQUIRED 语义 —— 旁路只增加成功的可能，
+        不允许让原本"需人工"的结果变成误报的"失败"。
+        """
+        masked = mask_id(sid)
+        fallback = (RenewalStatus.CAPTCHA_REQUIRED, "付款页需通过 Turnstile 验证码",
+                    await self.take_screenshot(sid, "captcha"), expiry, days)
+
+        cookie_str = await self.extract_cookies()
+        if not cookie_str:
+            logger.error("❌ UC 旁路取不到当前会话 cookie")
+            return fallback
+        if not SB_PAY_SCRIPT.exists():
+            logger.error(f"❌ 找不到 {SB_PAY_SCRIPT.name}")
+            return fallback
+
+        ensure_output_dir()
+        shot = screenshot_path(self.account_idx, sid, "uc")
+        # 结果文件名从截图路径派生：那份已经过 mask_id 脱敏并带时间戳，
+        # 直接拿 sid 拼会把完整 ID 写进日志里的路径。
+        out = str(Path(shot).with_suffix(".json"))
+        env = {**os.environ,
+               SB_PAY_COOKIE_ENV: cookie_str,
+               SB_PAY_PROXY_ENV: os.environ.get("CHROME_PROXY", "")}
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, str(SB_PAY_SCRIPT),
+                "--sid", sid, "--masked", masked, "--shot", shot, "--out", out,
+                env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=SB_PAY_TIMEOUT)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.error(f"❌ UC 旁路超时（{SB_PAY_TIMEOUT}s）")
+                return fallback
+        except Exception as e:
+            logger.error(f"❌ UC 旁路启动失败: {e}")
+            return fallback
+
+        # 子进程的日志只转印带 [uc] 前缀的行：SeleniumBase 本身很啰嗦，全转会淹掉主日志
+        for line in (stdout or b"").decode("utf-8", "replace").splitlines():
+            if "[uc]" in line:
+                logger.info(f"🧩 {line.strip()}")
+
+        try:
+            with open(out, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"❌ UC 旁路结果读取失败: {e}")
+            return fallback
+        finally:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+
+        return self._map_uc_result(data, masked, shot, expiry, days, fallback)
+
+    def _map_uc_result(self, data: Dict, masked: str, shot: str, expiry: str,
+                       days: int, fallback: Tuple) -> Tuple[RenewalStatus, str, str, str, int]:
+        """把 sb_pay.py 的返回值映射成续约结果。sb_pay 只回普通字符串，枚举映射留在这里，
+        它就不必反向 import 本模块（本模块以 __main__ 运行，import 会得到第二份实例）。"""
+        outcome = data.get("outcome", "")
+        shot = data.get("screenshot") or shot
+        if not os.path.exists(shot):
+            shot = ""
+
+        # 旁路会话可能已换到新的 PHPSESSID，回写时要用它，否则下次运行拿着旧会话
+        cookies = {k: v for k, v in (data.get("cookies") or {}).items()
+                   if k in PERSISTENT_COOKIE_NAMES}
+        if cookies:
+            self.uc_cookies = cookies
+
+        # 复核付款页读回的正文：到期日以它为准，比点击前的旧值新
+        new_expiry, new_days = parse_expiry(data.get("page_text") or "")
+        if new_expiry:
+            expiry, days = new_expiry, new_days
+
+        if outcome == "success":
+            logger.info(f"📝 结果: ✅ 服务器 {masked} 经验证码后续约成功")
+            return RenewalStatus.SUCCESS, "续约成功（已过验证码）", shot, expiry, days
+
+        if outcome == "captcha":
+            logger.warning("📝 结果: Turnstile 自动过验证失败")
+            return (RenewalStatus.CAPTCHA_REQUIRED, "付款页 Turnstile 自动过验证失败",
+                    shot, expiry, days)
+
+        if outcome == "blocked":
+            logger.warning("📝 结果: 会话被全站验证闸门锁定")
+            return (RenewalStatus.CAPTCHA_REQUIRED, "会话需通过 Turnstile 验证",
+                    shot, expiry, days)
+
+        toast = data.get("toast") or ""
+        if not toast:
+            # 既没 toast 也没成功标志，说明旁路本身没跑到点击结果，按"需人工"处理更诚实
+            logger.warning("📝 结果: UC 旁路未取到站点响应")
+            return (fallback[0], fallback[1], shot or fallback[2], expiry, days)
+
+        status, msg = classify_renew_error(toast)
+        logger.info(f"📝 结果: {msg}")
+        return status, msg, shot, expiry, days
+
     async def renew(self, sid: str) -> Tuple[RenewalStatus, str, str, str, int]:
         """续约服务器"""
+
         masked = mask_id(sid)
         screenshot_file = ""
         expiry = ""
@@ -554,12 +701,11 @@ class CastleClient:
 
             # 站点改版新增：服务端用 `const showCaptcha = true` 打开付款页 Turnstile。
             # 开启时 freePay() 会先取 turnstile.getResponse()，取不到就只弹 toast 而不发请求，
-            # 必须提前识别，否则点击后拿不到任何响应，只会得到"无响应"。
-            if re.search(r'const\s+showCaptcha\s*=\s*true', await self.page.content()):
-                logger.warning("🤖 付款页已开启 Turnstile 验证码，无法自动续约")
-                screenshot_file = await self.take_screenshot(sid, "captcha")
-                return (RenewalStatus.CAPTCHA_REQUIRED, "付款页需通过 Turnstile 验证码",
-                        screenshot_file, expiry, days)
+            # Playwright 点下去拿不到任何响应。此时交给 UC 模式旁路（sb_pay.py）真实鼠标过验证。
+            if re.search(r'const\s+showCaptcha\s*=\s*true', await self.page.content()) or FORCE_SB_PAY:
+                logger.warning("🤖 付款页已开启 Turnstile 验证码，转 UC 模式处理")
+                return await self._renew_via_uc(sid, expiry, days)
+
 
             if await self.captcha_gate_active():
                 logger.warning("🤖 会话已被验证码闸门锁定")
@@ -618,28 +764,12 @@ class CastleClient:
                 return RenewalStatus.SUCCESS, "续约成功", screenshot_file, expiry, days
 
             if data.get("status") == "error":
-                error_msg = data.get("error", "未知错误")
-                m = error_msg.lower()
+                status, msg = classify_renew_error(data.get("error", ""))
+                logger.info(f"📝 结果: {msg}")
+                stage = "limited" if status is RenewalStatus.RATE_LIMITED else "failed"
+                screenshot_file = await self.take_screenshot(sid, stage)
+                return status, msg, screenshot_file, expiry, days
 
-                # "уже продлен" 可能被站点改写为 "уже был продлен" 等变体，只匹配词干更稳
-                if "24 час" in m or "продлен" in m:
-                    logger.info(f"📝 结果: 今日已续期(24小时限制)")
-                    screenshot_file = await self.take_screenshot(sid, "limited")
-                    return RenewalStatus.RATE_LIMITED, "今日已续期(24小时限制)", screenshot_file, expiry, days
-
-                if "недостаточно" in m:
-                    logger.info(f"📝 结果: 余额不足")
-                    screenshot_file = await self.take_screenshot(sid, "failed")
-                    return RenewalStatus.FAILED, "余额不足", screenshot_file, expiry, days
-
-                if "валидации" in m:
-                    logger.info(f"📝 结果: CSRF验证失败")
-                    screenshot_file = await self.take_screenshot(sid, "csrf_failed")
-                    return RenewalStatus.FAILED, "CSRF验证失败", screenshot_file, expiry, days
-
-                logger.info(f"📝 结果: {error_msg}")
-                screenshot_file = await self.take_screenshot(sid, "failed")
-                return RenewalStatus.FAILED, error_msg, screenshot_file, expiry, days
 
             if not data and await self.captcha_gate_active():
                 logger.warning("📝 结果: 点击后被验证码闸门拦截")
@@ -735,7 +865,8 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier,
 
             for r in results:
                 if r.status == RenewalStatus.SUCCESS:
-                    status_icon, status_text = "✅", "续约成功"
+                    # UC 旁路会把"已过验证码"写进 message，这件事需要在通知里被看到
+                    status_icon, status_text = "✅", r.message or "续约成功"
                 elif r.status == RenewalStatus.RATE_LIMITED:
                     status_icon, status_text = "⏭️", "今日已续期"
                 elif r.status == RenewalStatus.CAPTCHA_REQUIRED:
@@ -756,7 +887,8 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier,
                 )
                 await notifier.send_photo(caption, r.screenshot)
 
-            new_cookie = await client.extract_cookies()
+            new_cookie = join_cookies(client.uc_cookies) if client.uc_cookies \
+                else await client.extract_cookies()
             # 与输入的规范化形式比较：只有值真的变了才回写，避免因为顺序或瞬态项反复改 secret
             if new_cookie and new_cookie != join_cookies(pairs):
                 logger.info(f"🔄 账号#{idx + 1} Cookie已变化")

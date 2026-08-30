@@ -14,7 +14,8 @@ permissions:
 jobs:
   add_time:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30 分钟而非 20：付款页开启 Turnstile 时会另起一个 UC 模式浏览器，最坏 6 轮点击各等 8 秒
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -27,9 +28,14 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright aiohttp pynacl
+          # xvfb 供 UC 模式用：SeleniumBase 官方明确 UC 模式在 headless 下可被检测，
+          # 必须有显示；xdotool / scrot 是 pyautogui 在 Linux 上取屏和移动鼠标的依赖。
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool scrot
+          pip install playwright aiohttp pynacl seleniumbase
           playwright install chromium
           playwright install-deps chromium
+          seleniumbase install chromedriver
 
       - name: Start Proxy Tunnel
         env:
@@ -78,8 +84,16 @@ jobs:
           # 仅浏览器经代理出网，指向本地 sing-box mixed 入站。
           # PROXY_URL 为空时此值为空串，renew.py 转 None 直连。
           # Telegram / GitHub API 的 aiohttp 请求始终直连，不受代理影响。
+          # sb_pay.py 的 UC 浏览器复用同一个值（自己剥掉 scheme），不另设变量。
           CHROME_PROXY: ${{ secrets.PROXY_URL != '' && 'http://127.0.0.1:8118' || '' }}
-        run: python renew.py
+
+          # 置 1 强制走 UC 模式旁路，用于在站点尚未开启付款页验证码时验证整链是否通。
+          # 平时留空：站点 showCaptcha 为假时旁路不会被触发。
+          CASTLE_FORCE_SB_PAY: ${{ vars.CASTLE_FORCE_SB_PAY }}
+        # xvfb-run 包住整个脚本：Playwright 仍以 headless 跑、不受影响；
+        # 只有 UC 模式旁路真正需要这块虚拟显示。
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
+
 
       - name: Stop Proxy Tunnel
         if: always()
