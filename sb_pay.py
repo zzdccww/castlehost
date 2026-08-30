@@ -290,11 +290,10 @@ def run(sid: str, masked: str, shot: str) -> Dict:
         log("未取到可用 cookie")
         result["toast"] = "UC 旁路未取到 cookie"
         return result
-    # 没有 PHPSESSID 就不可能是登录态，付款页会被重定向到登录页，六轮点击必然白跑
+    # 站点自 2026-08-29 起在 PHPSESSID 缺席的情况下依然认这个会话（uid 单独就够），
+    # 所以缺它只告警不放弃 —— 真没登录会在下面的 path 判断和诊断里露出来。
     if "PHPSESSID" not in pairs:
-        log(f"cookie 里没有 PHPSESSID（只有 {','.join(sorted(pairs))}）")
-        result["toast"] = "UC 旁路未取到会话 cookie"
-        return result
+        log(f"cookie 里没有 PHPSESSID，只有 {','.join(sorted(pairs))}")
 
     kwargs = {"uc": True, "headless": False}   # UC 模式在 headless 下可被检测，显示由 xvfb 提供
     proxy = norm_proxy(os.environ.get(PROXY_ENV, ""))

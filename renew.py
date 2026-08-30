@@ -800,8 +800,14 @@ class CastleClient:
         同名 cookie 可能同时存在两份：我们注入的 .castle-host.com 和站点自己下发的
         cp.castle-host.com。后者才是站点当前认的值，所以让 host-only 的那份覆盖。"""
         try:
+            all_cookies = await self.ctx.cookies()
+            # 只打名字不打值。站点 2026 年改版后到底发哪些 cookie、会话靠哪一个，
+            # 只有这一行能看出来 —— 白名单漏了新的会话 cookie 会静默丢会话。
+            names = sorted({c["name"] for c in all_cookies
+                            if "castle-host.com" in c.get("domain", "")})
+            logger.info(f"🍪 站点当前下发: {','.join(names) or '(空)'}")
             cc = [
-                c for c in await self.ctx.cookies()
+                c for c in all_cookies
                 if "castle-host.com" in c.get("domain", "") and c["name"] in PERSISTENT_COOKIE_NAMES
             ]
             cc.sort(key=lambda c: c.get("domain", "").startswith("."), reverse=True)
