@@ -103,6 +103,14 @@ DOM 只作为兜底：续约成功还会检查 `.iziToast-message:has-text("Ус
 - 结果 JSON 的文件名从截图路径 `with_suffix(".json")` 派生，不用 sid 现拼 —— 截图路径已经过 `mask_id()` 脱敏，直接拼会把完整 ID 写进日志里的路径。
 - `sb_pay.py` 的 `handle_pay_turnstile()` 照搬 katabump 的三段结构：先查是否静默通过（managed 模式常常自己就过，省掉这步会白点六轮）→ 注入 JS 解除父容器 `overflow:hidden` 裁剪并把 iframe 撑回可见尺寸（否则坐标点击点不到实际复选框）→ 最多 6 轮点击，每轮轮询 8 秒。
 
+**`js()` 必须给每段脚本补 `return`。** Selenium 把脚本当成匿名函数的函数体执行，只有 `return` 出来的值才回传。本模块的片段（以及被参考的 `D:\katabump\app.py`）都写成 `(function(){...})()` 表达式形式，直接交给 `execute_script` 会一律拿到 `None` 且不抛异常 —— `solved()` 永远为假、六轮点击必然"失败"、`toast_text()` 永远读成空串，而日志上看不出任何异常。本地用 selenium 4.41 + headless Chrome 对照实测过。改动这些 JS 片段时不要把 `return` 拿掉，也不要把 `js()` 里的异常日志改回静默 `return None`：吞掉异常会把任何故障都伪装成"验证码没过"。
+
+**`showCaptcha` 是按会话风险现算的，不是站点开关。** 2026-08-30 同一个 job 内实测：Playwright 会话拿到 `true`，紧接着新开的 UC 会话拿到 `false`（诊断输出 `iframes=0 | pay-box=false`）；同日 04:25 的另一次运行 Playwright 侧也拿到 `false` 并正常续约。所以旁路的价值不只是"过验证码"，更是"换一个不被判定的会话"。`run()` 因此先判断 `#cf-turnstile-pay` 是否存在：不存在就跳过过验证直接点 `#freebtn`（`freePay()` 在标志为假时不读 token），硬跑六轮只会白等 70 秒再把一次本可成功的续约报成"验证码没过"。
+
+**点击前必须把控件滚进视口。** 付款页 `scrollHeight` 约 1704、`#freebtn` 在 `y≈807`，而 UC 窗口视口只有 680-753 高 —— 控件默认在折叠线以下。`uc_gui_click_captcha()` 按元素坐标驱动操作系统鼠标，元素不在视口里那一下就点在别处，既不报错也拿不到 token。`_SCROLL_JS` 每轮点击前 `scrollIntoView({block:'center'})` 并把 `inview` 打进日志（实测第 1 轮 `inview=false`，滚动后转 `true`）。另外不要给父容器设 `minWidth: max-content`（katabump 那样做是因为它的布局会裁剪）：本站付款卡片宽度贴着视口，撑开会多出横向滚动条，把控件 x 坐标整体推走，而坐标正是这套点击方案的依据。
+
+**`uc_gui_click_captcha(frame=...)` 的默认值靠不住。** 默认 `frame="iframe"` 只认页面第一个 iframe，而 `#validateModal` 里常驻另一个 Turnstile 容器 `#cf-turnstile-validate`（`showCaptcha` 为假时该元素也在）。显式传 `frame="#cf-turnstile-pay"`，抛异常才退回默认值。
+
 
 **CI 代理链路（借鉴 luneshost 项目）。** 因上述 IP 质询风险，workflow 可选地在 runner 本机拉起隧道，链路是：
 
@@ -122,7 +130,9 @@ DOM 只作为兜底：续约成功还会检查 `.iziToast-message:has-text("Ус
 
 **Cookie 自动轮换。** 每个账号跑完后 `extract_cookies()` 从 BrowserContext 取回最新 cookie；若与输入不同，`GitHubManager.update_secret()` 用 libsodium sealed box（pynacl）加密后 PUT 回 `CASTLE_COOKIES` secret。注意所有账号的新 cookie 会重新拼成一个逗号串整体覆盖，单账号失败时（返回 `None`）会保留原值以免污染其他账号。
 
-**只有 `PERSISTENT_COOKIE_NAMES` 里的 cookie 跨运行保留**（`PHPSESSID` / `uid` / `cookie_consent`）。`cookie_pairs()` 在解析输入时就丢掉其余项，`extract_cookies()` 回写时同样只留这三个。原因是 DDoS-Guard 的 `__ddg*` 与出口 IP、签发时刻绑定，站点每次访问都会重发，把上一次运行的旧值再喂回去只会带来风险；写回的串按名字排序（`join_cookies()`），因此"有没有变化"的比较只反映值的变化，不受 cookie jar 返回顺序影响。同名 cookie 可能同时存在 `.castle-host.com`（我们注入的）和 `cp.castle-host.com`（站点下发的）两份，取回时让 host-only 那份覆盖 —— 那才是站点当前认的值。
+**只有 `PERSISTENT_COOKIE_NAMES` 里的 cookie 跨运行保留**（`CH_SESSION` / `PHPSESSID` / `uid` / `cookie_consent`）。`cookie_pairs()` 在解析输入时就丢掉其余项，`extract_cookies()` 回写时同样只留这几个。原因是 DDoS-Guard 的 `__ddg*` 与出口 IP、签发时刻绑定，站点每次访问都会重发，把上一次运行的旧值再喂回去只会带来风险；写回的串按名字排序（`join_cookies()`），因此"有没有变化"的比较只反映值的变化，不受 cookie jar 返回顺序影响。同名 cookie 可能同时存在 `.castle-host.com`（我们注入的）和 `cp.castle-host.com`（站点下发的）两份，取回时让 host-only 那份覆盖 —— 那才是站点当前认的值。
+
+**站点的会话 cookie 叫 `CH_SESSION`，不是 `PHPSESSID`。** 2026-08-30 实测下发清单为 `CH_SESSION,__ddg10_,__ddg1_,__ddg8_,__ddg9_,cookie_consent,uid`，没有 `PHPSESSID`。白名单早期只写了 `PHPSESSID`，于是每次运行都把站点刚发的会话丢掉，UC 子进程也拿不到登录态；能一直跑通是因为 `uid` 单独就足以让站点认账（08-29 13:30 与 08-30 04:25 两次续约都是在没有任何会话 cookie 的情况下成功的）。`PHPSESSID` 保留在名单里只为兼容老会话。`extract_cookies()` 会打印站点当前下发的全部 cookie 名字（只打名字不打值），站点再改名时看这一行。
 
 **每账号独立浏览器实例。** `process_account()` 内部各自 `async_playwright()` 启动/关闭浏览器，账号之间 sleep 5 秒，账号处理串行不并发。
 

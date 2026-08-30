@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 BASE = "https://cp.castle-host.com"
 COOKIE_ENV = "CASTLE_UC_COOKIES"
 PROXY_ENV = "CASTLE_UC_PROXY"
-PERSISTENT_COOKIE_NAMES = ("PHPSESSID", "uid", "cookie_consent")
+PERSISTENT_COOKIE_NAMES = ("CH_SESSION", "PHPSESSID", "uid", "cookie_consent")
 
 SOLVE_ROUNDS = 6      # 每轮一次点击，与 katabump 一致
 POLL_SECONDS = 8      # 每轮点击后等结果的秒数
@@ -290,10 +290,10 @@ def run(sid: str, masked: str, shot: str) -> Dict:
         log("未取到可用 cookie")
         result["toast"] = "UC 旁路未取到 cookie"
         return result
-    # 站点自 2026-08-29 起在 PHPSESSID 缺席的情况下依然认这个会话（uid 单独就够），
-    # 所以缺它只告警不放弃 —— 真没登录会在下面的 path 判断和诊断里露出来。
+    # 站点自 2026-08-29 起在 PHPSESSID 缺席的情况下依然认这个会话（会话 cookie 已改名
+    # CH_SESSION，uid 单独也够），所以缺它只告警不放弃。
     if "PHPSESSID" not in pairs:
-        log(f"cookie 里没有 PHPSESSID，只有 {','.join(sorted(pairs))}")
+        log(f"注入的 cookie 不含 PHPSESSID，实为 {','.join(sorted(pairs))}")
 
     kwargs = {"uc": True, "headless": False}   # UC 模式在 headless 下可被检测，显示由 xvfb 提供
     proxy = norm_proxy(os.environ.get(PROXY_ENV, ""))
@@ -340,11 +340,18 @@ def run(sid: str, masked: str, shot: str) -> Dict:
             result["cookies"] = collect_cookies(sb)
             return result
 
-        if not handle_pay_turnstile(sb):
-            result["outcome"] = "captcha"
-            result["screenshot"] = shoot(sb, shot)
-            result["cookies"] = collect_cookies(sb)
-            return result
+        # 有控件才去过验证。实测同一个 job 里 Playwright 会话拿到 showCaptcha=true、
+        # 新开的 UC 会话却拿到 false —— 这个标志按会话风险现算，不只看出口 IP。
+        # 没有控件就没什么要过的，freePay() 在该标志为假时不读 token，直接点续约即可；
+        # 硬跑六轮只会白等 70 秒然后把一次本可成功的续约报成"验证码没过"。
+        if js(sb, "!!document.querySelector('#cf-turnstile-pay')", "present"):
+            if not handle_pay_turnstile(sb):
+                result["outcome"] = "captcha"
+                result["screenshot"] = shoot(sb, shot)
+                result["cookies"] = collect_cookies(sb)
+                return result
+        else:
+            log("付款页未渲染 Turnstile 控件，无需过验证")
 
         if not sb.is_element_present("#freebtn"):
             log("找不到续约按钮")

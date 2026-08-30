@@ -32,10 +32,13 @@ OUTPUT_DIR = Path("output/screenshots")
 CONSENT_COOKIE_NAME = "cookie_consent"
 CONSENT_COOKIE_VALUE = "accepted"
 
-# 只有这三个 cookie 值得跨运行保留：前两个是账号凭据，第三个用来压掉同意横幅。
+# 只有这几个 cookie 值得跨运行保留：前三个是账号凭据，最后一个用来压掉同意横幅。
 # 其余（尤其是 DDoS-Guard 的 __ddg*）与出口 IP 和签发时刻绑定，站点每次访问都会重发；
 # 把上一次运行留下的旧值再喂回去，GET 仍能通过，但会话相关的 POST 可能被判成非法请求。
-PERSISTENT_COOKIE_NAMES = ("PHPSESSID", "uid", CONSENT_COOKIE_NAME)
+# CH_SESSION 是站点 2026 年改版后实际在用的会话 cookie（实测下发清单里有它，没有
+# PHPSESSID）。漏掉它等于每次运行都把活会话丢掉，UC 子进程也拿不到登录态。
+# PHPSESSID 保留在名单里：老会话可能还带着它，留着不会有副作用。
+PERSISTENT_COOKIE_NAMES = ("CH_SESSION", "PHPSESSID", "uid", CONSENT_COOKIE_NAME)
 
 # 付款页开启 Turnstile 时的旁路：sb_pay.py 以子进程运行 SeleniumBase UC 模式，用真实鼠标过验证。
 # 单独进程而不是 import，是因为 SeleniumBase 同步阻塞、pyautogui 又要求有显示，

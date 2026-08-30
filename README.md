@@ -87,7 +87,7 @@ Cookie 失效时不推续约结果，而是单独推一条"Cookie 已失效"并�
 
 站点会在访问过程中刷新 Cookie。配置 `REPO_TOKEN` 后，脚本每次跑完会把新 Cookie 加密（libsodium sealed box）回写到 `CASTLE_COOKIES`，省去手动更新。不配置也能跑，只是 Cookie 过期后要自己换。
 
-回写只保留 `PHPSESSID`、`uid`、`cookie_consent` 三项。DDoS-Guard 下发的 `__ddg*` 等临时 Cookie 与出口 IP、签发时刻绑定，站点每次访问都会重发，留着反而可能让请求被判成非法，所以一律丢弃。
+回写只保留 `CH_SESSION`、`PHPSESSID`、`uid`、`cookie_consent` 四项。`CH_SESSION` 是站点当前实际在用的会话 cookie。DDoS-Guard 下发的 `__ddg*` 等临时 Cookie 与出口 IP、签发时刻绑定，站点每次访问都会重发，留着反而可能让请求被判成非法，所以一律丢弃。
 
 Actions 内置的 `GITHUB_TOKEN` 不具备改写 Secrets 的能力，只能自己签发一个 PAT。
 
