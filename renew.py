@@ -582,6 +582,10 @@ class CastleClient:
         if not cookie_str:
             logger.error("❌ UC 旁路取不到当前会话 cookie")
             return fallback
+        # extract_cookies() 只回收站点当前认的项，cookie_consent 可能已被站点清掉。
+        # 交给 UC 会话前用 cookie_pairs() 补回默认值，否则同意横幅会盖住 #freebtn。
+        # 这里复用同一个解析函数而不另写一份：输入已无瞬态项，不会重复打"已丢弃"日志。
+        cookie_str = join_cookies(cookie_pairs(cookie_str))
         if not SB_PAY_SCRIPT.exists():
             logger.error(f"❌ 找不到 {SB_PAY_SCRIPT.name}")
             return fallback

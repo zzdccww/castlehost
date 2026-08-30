@@ -34,6 +34,12 @@ SOLVE_ROUNDS = 6      # 每轮一次点击，与 katabump 一致
 POLL_SECONDS = 8      # 每轮点击后等结果的秒数
 RECONNECT = 6         # uc_open_with_reconnect 的断连时长，越长越不容易被识别
 
+# uc_gui_click_captcha(frame=...) 的默认值是 "iframe"，即页面上的第一个 iframe。
+# 本站会同时渲染两个 Turnstile：会话闸门的 #cf-turnstile-validate（藏在 #validateModal 内，
+# 平时不可见）和付款用的 #cf-turnstile-pay。取默认值会让点击落到 DOM 里排在前面的那个，
+# 于是既不抛异常也拿不到 token —— 必须显式指定付款控件所在的容器。
+PAY_FRAME = "#cf-turnstile-pay"
+
 # 与 renew.py 同样的处理：Windows 控制台默认 GBK，日志里的中文会抛 UnicodeEncodeError。
 # 本模块是被调用方以子进程拉起的，输出还要回传给主进程解码，编码不统一会读出乱码。
 if hasattr(sys.stdout, "reconfigure"):
@@ -56,8 +62,9 @@ _SOLVED_JS = """
 })()
 """
 
-# 控件常被父容器 overflow:hidden 裁掉，或被压成 0 尺寸；此时坐标点击点不到实际复选框。
-# 逐层放开 overflow 并把 challenges.cloudflare.com 的 iframe 撑回可见尺寸。
+# 控件常被父容器 overflow:hidden 裁掉；逐层放开 overflow 并把 challenges.cloudflare.com 的
+# iframe 撑回可见尺寸。不动父容器的 minWidth：本站付款卡片宽度本来就贴着视口，强行
+# max-content 会撑出横向滚动条，把控件的 x 坐标整体推走 —— 坐标点击靠的就是这个坐标。
 _EXPAND_JS = """
 (function() {
     var anchor = document.querySelector('input[name="cf-turnstile-response"]')
@@ -70,7 +77,6 @@ _EXPAND_JS = """
         var s = window.getComputedStyle(el);
         if (s.overflow === 'hidden' || s.overflowX === 'hidden' || s.overflowY === 'hidden')
             el.style.overflow = 'visible';
-        el.style.minWidth = 'max-content';
     }
     document.querySelectorAll('iframe').forEach(function(f){
         if (f.src && f.src.includes('challenges.cloudflare.com')) {
@@ -80,6 +86,50 @@ _EXPAND_JS = """
         }
     });
     return 'done';
+})()
+"""
+
+# 把控件滚进视口中央。这一步是必须的，不是保险：付款页 scrollHeight 约 1704，#freebtn 在
+# y≈807，而 UC 窗口视口只有 753 高 —— 控件默认落在折叠线以下。uc_gui_click_captcha() 按元素
+# 坐标驱动操作系统鼠标，元素不在视口里，那一下就点在别处，既不报错也拿不到 token。
+_SCROLL_JS = """
+(function(){
+    var box = document.querySelector('#cf-turnstile-pay')
+           || document.querySelector('input[name="cf-turnstile-response"]')
+           || document.querySelector('#freebtn');
+    if (!box) return 'no-anchor';
+    box.scrollIntoView({block: 'center', inline: 'nearest'});
+    var r = box.getBoundingClientRect();
+    return Math.round(r.width) + 'x' + Math.round(r.height)
+         + '@' + Math.round(r.left) + ',' + Math.round(r.top)
+         + ' vh=' + window.innerHeight
+         + ' inview=' + (r.top >= 0 && r.bottom <= window.innerHeight);
+})()
+"""
+
+# 诊断用。六轮点击既不报错也拿不到 token 时，光看日志分不清是"控件没找到"还是"点了被拒"，
+# 这一行把控件的真实处境（有几个 iframe、付款控件多大、在哪、可见性）摊开。
+# 只取 hostname 不取完整 src：iframe 的 query 里可能带会话相关参数，仓库公开。
+_DIAG_JS = """
+(function(){
+    var out = [];
+    var frames = document.querySelectorAll('iframe');
+    out.push('iframes=' + frames.length);
+    for (var i = 0; i < frames.length && i < 6; i++) {
+        var f = frames[i], r = f.getBoundingClientRect(), host = '';
+        try { host = new URL(f.src, location.href).hostname; } catch (e) {}
+        var s = window.getComputedStyle(f);
+        out.push('[' + i + ']' + (host || 'blank')
+                 + ' id=' + (f.id || '-')
+                 + ' ' + Math.round(r.width) + 'x' + Math.round(r.height)
+                 + '@' + Math.round(r.left) + ',' + Math.round(r.top)
+                 + ' vis=' + s.visibility + ' disp=' + s.display);
+    }
+    out.push('pay-box=' + !!document.querySelector('#cf-turnstile-pay'));
+    out.push('turnstile-api=' + !!window.turnstile);
+    out.push('freebtn=' + !!document.querySelector('#freebtn'));
+    out.push('gate=' + !!document.querySelector('#validateModal.show'));
+    return out.join(' | ');
 })()
 """
 
@@ -125,6 +175,24 @@ def solved(sb) -> bool:
     return bool(js(sb, _SOLVED_JS))
 
 
+def click_captcha(sb) -> str:
+    """点一次验证码，返回实际走的定位方式（只为日志可读）。
+
+    先按 PAY_FRAME 定位。SeleniumBase 版本较老不认 frame 参数、或该容器当时不在页面上时，
+    退回默认行为再试一次 —— 默认值有可能点中，总比这一轮什么都不做好。
+    """
+    try:
+        sb.uc_gui_click_captcha(frame=PAY_FRAME)
+        return f"frame={PAY_FRAME}"
+    except Exception as e:
+        log(f"按 {PAY_FRAME} 定位失败({e})，退回默认 iframe")
+    try:
+        sb.uc_gui_click_captcha()
+        return "frame=iframe(默认)"
+    except Exception as e:
+        return f"两种定位均异常: {e}"
+
+
 def handle_pay_turnstile(sb) -> bool:
     """三段结构与 katabump 的 handle_turnstile 一致：先看是否静默通过，再解除裁剪，最后反复点。
 
@@ -135,19 +203,21 @@ def handle_pay_turnstile(sb) -> bool:
         log("turnstile 已静默通过")
         return True
 
+    expanded = None
     for _ in range(3):
-        js(sb, _EXPAND_JS)
+        expanded = js(sb, _EXPAND_JS)
         time.sleep(0.5)
+    # 'no-turnstile' 表示控件根本没渲染，与"渲染了但点不中"是两种完全不同的故障
+    log(f"解除裁剪: {expanded}")
+    log(f"诊断: {js(sb, _DIAG_JS)}")
 
     for attempt in range(1, SOLVE_ROUNDS + 1):
         if solved(sb):
             log(f"turnstile 已通过（第 {attempt - 1} 轮后）")
             return True
-        log(f"第 {attempt}/{SOLVE_ROUNDS} 轮 uc_gui_click_captcha")
-        try:
-            sb.uc_gui_click_captcha()
-        except Exception as e:
-            log(f"uc_gui_click_captcha 异常: {e}")
+        # 每轮都重新滚：点击、页面自身的重排都可能把控件再挪出视口
+        log(f"第 {attempt}/{SOLVE_ROUNDS} 轮 滚动 {js(sb, _SCROLL_JS)}")
+        log(f"  点击 -> {click_captcha(sb)}")
         for _ in range(POLL_SECONDS * 2):
             time.sleep(0.5)
             if solved(sb):
@@ -155,6 +225,7 @@ def handle_pay_turnstile(sb) -> bool:
                 return True
 
     log(f"turnstile {SOLVE_ROUNDS} 轮均未通过")
+    log(f"收尾诊断: {js(sb, _DIAG_JS)}")
     return False
 
 
@@ -197,7 +268,8 @@ def shoot(sb, shot: str) -> str:
 
 
 def run(sid: str, masked: str, shot: str) -> Dict:
-    from seleniumbase import SB   # 只有走到这条旁路才需要这个依赖
+    import seleniumbase                # 只有走到这条旁路才需要这个依赖
+    from seleniumbase import SB
 
     result = {"outcome": "error", "toast": "", "page_text": "",
               "cookies": {}, "screenshot": ""}
@@ -215,20 +287,31 @@ def run(sid: str, masked: str, shot: str) -> Dict:
         log("浏览器经代理出网")   # 不打印地址：仓库公开，Actions 日志同样公开
 
     pay_url = f"{BASE}/servers/pay/index/{sid}"
+    log(f"seleniumbase {getattr(seleniumbase, '__version__', '?')}")
     with SB(**kwargs) as sb:
+        # 窗口撑满 xvfb 的 1920x1080：视口越高，控件越可能一开始就在折叠线以上，
+        # 少一次滚动就少一次错位的机会。失败无所谓，滚动那步会兜住。
+        try:
+            sb.maximize_window()
+        except Exception as e:
+            log(f"最大化窗口失败: {e}")
         # 先落到域名下才能注 cookie（Selenium 不允许给当前域之外的域设 cookie）
         sb.uc_open_with_reconnect(f"{BASE}/servers", RECONNECT)
         sb.add_cookies([
             {"name": n, "value": v, "domain": ".castle-host.com", "path": "/"}
             for n, v in pairs.items()
         ], expiry=False)
-        log(f"已注入 {len(pairs)} 个 cookie，打开服务器 {masked} 的付款页")
+        # 只打名字不打值。缺 cookie_consent 时同意横幅会盖住 #freebtn，这里要看得出来
+        log(f"已注入 cookie: {','.join(sorted(pairs))}，打开服务器 {masked} 的付款页")
         sb.uc_open_with_reconnect(pay_url, RECONNECT)
+        # 不打印完整 URL：尾段就是服务器 ID。只看有没有被挑战页顶掉
+        log(f"付款页已加载: {'/servers/pay/' in (sb.get_current_url() or '')}")
 
         # cookie_consent 已随 cookie 注入，横幅通常不出现；出现了就点掉，否则会遮挡 #freebtn
         try:
             if sb.is_element_visible("#cookieAcceptAll"):
                 sb.click("#cookieAcceptAll")
+                log("已点掉 cookie 同意横幅")
                 time.sleep(0.5)
         except Exception:
             pass
