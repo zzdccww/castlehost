@@ -1,57 +1,68 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Castle-Host 服务器自动续约脚本 (带截图)
-功能：多账号支持 + 自动启动关机服务器 + Cookie自动更新 + 截图通知
-配置变量:CASTLE_COOKIES=PHPSESSID=xxx; uid=xxx,PHPSESSID=xxx; uid=xxx  (多账号用,逗号分隔)
+Castle-Host 服务器自动续约脚本（SeleniumBase UC 单栈）
+
+登录 cp.castle-host.com（俄语站点），每天停机窗口后开机 + 续约免费服务器，结果附截图推 Telegram。
+
+为什么整站只用 SeleniumBase UC、不再用 Playwright：
+被站点判定的会话，其状态变更 POST（开机 /servers/control/action/.../start、续约
+/servers/pay/buy_months/）一律回 "Ошибка валидации запроса!"，即便带了合法 CSRF token、
+且没弹验证码闸门。实测同一 job 内 Playwright 主会话被判定、新开的 UC 会话被信任并续约成功。
+UC 模式（uc_gui_click_captcha 点击瞬间断开 webdriver、由操作系统鼠标点击）既能过 Turnstile、
+其会话也更少被判定。于是开机与续约都放进同一个 UC 会话，消灭原来"Playwright 主路径 + UC 旁路"
+双栈及其子进程粘合代码。
+
+代价（相对旧版）：
+- 判定基准从"响应体拦截"退为"DOM/状态复核"：UC 导航时断开 webdriver，读不到 XHR 响应体。
+  续约以"到期日前移"为硬判据、toast 文本为辅；开机以 check_server_stopped 状态翻转为硬判据。
+- 全程需要显示器：UC 靠真实鼠标，不能 headless。CI 用 xvfb-run 包住整段脚本。
+  **本地不能在自己桌面上跑 —— 会抢走鼠标控制权。**
+- 单账号更慢：UC + uc_open_with_reconnect 比 headless Playwright 慢，每账号约 60-90 秒起。
+
+配置变量：CASTLE_COOKIES=PHPSESSID=xxx; uid=xxx,PHPSESSID=xxx; uid=xxx（多账号逗号分隔，账号内分号分隔）。
 """
 
 import os
 import sys
 import re
-import json
+import time
 import logging
-import asyncio
-import aiohttp
 from pathlib import Path
 from enum import Enum
 from base64 import b64encode
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
-from urllib.parse import urlsplit, unquote
-from playwright.async_api import async_playwright, BrowserContext, Page
 
+import requests
+
+BASE = "https://cp.castle-host.com"
 LOG_FILE = "castle_renew.log"
 REQUEST_TIMEOUT = 30
-PAGE_TIMEOUT = 60000
 OUTPUT_DIR = Path("output/screenshots")
 
-# 站点 2026 年改版后新增：cookie 同意横幅 + Cloudflare Turnstile 会话验证闸门。
-# 预置 cookie_consent 可阻止横幅渲染，避免它遮挡 #freebtn 导致点击被拦截。
+# UC 导航 / 过验证参数
+RECONNECT = 6      # uc_open_with_reconnect 断连时长，越长越不易被识别
+RELOAD_RECONNECT = 3   # 复核性重载（读到期日/状态）用更短的断连，省时间
+SOLVE_ROUNDS = 6   # 付款页 Turnstile 每轮点一次
+POLL_SECONDS = 8   # 点击/操作后等结果的秒数
+# uc_gui_click_captcha 默认 frame="iframe" 只认第一个 iframe，而 #validateModal 里常驻另一个
+# Turnstile 容器 #cf-turnstile-validate。必须显式指定付款控件所在容器。
+PAY_FRAME = "#cf-turnstile-pay"
+
+# 站点 2026 年改版新增：cookie 同意横幅缺 cookie_consent 时渲染，会遮挡 #freebtn。
 CONSENT_COOKIE_NAME = "cookie_consent"
 CONSENT_COOKIE_VALUE = "accepted"
 
-# 只有这几个 cookie 值得跨运行保留：前三个是账号凭据，最后一个用来压掉同意横幅。
-# 其余（尤其是 DDoS-Guard 的 __ddg*）与出口 IP 和签发时刻绑定，站点每次访问都会重发；
-# 把上一次运行留下的旧值再喂回去，GET 仍能通过，但会话相关的 POST 可能被判成非法请求。
-# CH_SESSION 是站点 2026 年改版后实际在用的会话 cookie（实测下发清单里有它，没有
-# PHPSESSID）。漏掉它等于每次运行都把活会话丢掉，UC 子进程也拿不到登录态。
-# PHPSESSID 保留在名单里：老会话可能还带着它，留着不会有副作用。
+# 只有这几个 cookie 值得跨运行保留。其余（尤其 DDoS-Guard 的 __ddg*）与出口 IP、签发时刻绑定，
+# 站点每次访问都会重发；重放旧值可能让 POST 被判成非法请求。CH_SESSION 是站点当前实际在用的
+# 会话 cookie（实测下发清单里有它、无 PHPSESSID）；uid 单独也足以让站点认账。
+# PHPSESSID 保留只为兼容老会话。
 PERSISTENT_COOKIE_NAMES = ("CH_SESSION", "PHPSESSID", "uid", CONSENT_COOKIE_NAME)
 
-# 付款页开启 Turnstile 时的旁路：sb_pay.py 以子进程运行 SeleniumBase UC 模式，用真实鼠标过验证。
-# 单独进程而不是 import，是因为 SeleniumBase 同步阻塞、pyautogui 又要求有显示，
-# 隔离开来卡死或崩溃都不会带走主脚本，超时由这里兜住。
-SB_PAY_SCRIPT = Path(__file__).with_name("sb_pay.py")
-SB_PAY_TIMEOUT = 300          # 最坏情况：启动浏览器 + 6 轮点击各等 8 秒 + 两次导航
-SB_PAY_COOKIE_ENV = "CASTLE_UC_COOKIES"
-SB_PAY_PROXY_ENV = "CASTLE_UC_PROXY"
-# 站点当前 showCaptcha 为假，这条旁路平时走不到。置 1 可强制走一次，用来验证整链是否通。
-FORCE_SB_PAY = os.environ.get("CASTLE_FORCE_SB_PAY", "").strip() == "1"
 
-
-# Windows 控制台默认 GBK，日志里的 emoji 会抛 UnicodeEncodeError（CI 的 Linux 是 UTF-8，不受影响）。
+# Windows 控制台默认 GBK，日志里的 emoji 会抛 UnicodeEncodeError（CI 的 Linux 是 UTF-8）。
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -100,7 +111,7 @@ class Config:
     tg_chat_id: Optional[str]
     repo_token: Optional[str]
     repository: Optional[str]
-    browser_proxy: Optional[Dict[str, str]]
+    proxy: Optional[str]   # host:port 或 user:pass@host:port，不带 scheme（SeleniumBase 要求）
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -111,8 +122,19 @@ class Config:
             tg_chat_id=os.environ.get("TG_CHAT_ID"),
             repo_token=os.environ.get("REPO_TOKEN"),
             repository=os.environ.get("GITHUB_REPOSITORY"),
-            browser_proxy=build_proxy(os.environ.get("CHROME_PROXY", ""))
+            proxy=norm_proxy(os.environ.get("CHROME_PROXY", "")),
         )
+
+
+def norm_proxy(raw: str) -> Optional[str]:
+    """SeleniumBase 的 proxy 取 host:port 或 user:pass@host:port，不带 scheme。
+    CI 里 CHROME_PROXY 是 http://127.0.0.1:8118 那种带 scheme 的形式，这里剥掉。"""
+    raw = (raw or "").strip()
+    for prefix in ("http://", "https://", "socks5://", "socks5h://", "socks4://"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+    return raw.rstrip("/") or None
 
 
 def ensure_output_dir():
@@ -121,8 +143,7 @@ def ensure_output_dir():
 
 def screenshot_path(account_idx: int, server_id: str, stage: str) -> str:
     timestamp = datetime.now().strftime("%H%M%S")
-    # mask_id 产出的 * 在 Windows 上是非法文件名字符；server_id 也可能是 "login"/"error" 这类标记，
-    # 不做净化会让出错路径的截图存不下来（恰好是最需要截图的时候）。
+    # mask_id 产出的 * 在 Windows 上是非法文件名字符；server_id 也可能是 "login"/"error" 这类标记。
     masked = re.sub(r"[^0-9A-Za-z_-]", "_", mask_id(server_id))
     filename = f"acc{account_idx + 1}_{masked}_{stage}_{timestamp}.png"
     return str(OUTPUT_DIR / filename)
@@ -155,7 +176,7 @@ def convert_date(s: str) -> str:
 def days_left(s: str) -> int:
     try:
         return (datetime.strptime(s, "%d.%m.%Y") - datetime.now()).days
-    except:
+    except Exception:
         return 0
 
 
@@ -173,12 +194,18 @@ def parse_expiry(text: str) -> Tuple[str, int]:
     return expiry, days
 
 
-def classify_renew_error(error_msg: str) -> Tuple[RenewalStatus, str]:
-    """把站点返回的俄语报错归类。两条续约路径（Playwright 主路径读接口 JSON，UC 旁路读 toast）
-    共用这一份规则，避免同一批俄语子串出现两处、改一处漏一处。
+def expiry_advanced(old: str, new: str) -> bool:
+    """到期日是否前移。UC 没有响应体可读，续约成功的硬判据就是重载付款页后到期日变大。
+    两者都能解析且 new > old 才算，避免把读不出日期当成成功。"""
+    try:
+        return datetime.strptime(new, "%d.%m.%Y") > datetime.strptime(old, "%d.%m.%Y")
+    except Exception:
+        return False
 
-    判断依赖俄语子串，不要改成英文：站点只发俄语。
-    """
+
+def classify_renew_error(error_msg: str) -> Tuple[RenewalStatus, str]:
+    """把站点返回的俄语报错/ toast 归类。续约与开机两处都喂它页面 toast 原文，
+    规则集中一处，改一处不漏。判断依赖俄语子串，不要改成英文：站点只发俄语。"""
     m = (error_msg or "").lower()
     if not m:
         return RenewalStatus.FAILED, "未知错误"
@@ -192,14 +219,9 @@ def classify_renew_error(error_msg: str) -> Tuple[RenewalStatus, str]:
     return RenewalStatus.FAILED, error_msg
 
 
-
 def cookie_pairs(s: str) -> Dict[str, str]:
-    """把一个账号的 cookie 串解析成 name -> value。
-
-    同名 cookie 只保留最后一次出现：浏览器 cookie jar 本来就以 name+domain+path 为键，
-    这里显式去重是为了让"保留哪一个"变成确定行为，而不是取决于 add_cookies 的顺序。
-    不在白名单里的 cookie（如 __ddg*）一律丢弃，交给站点当场重新签发。
-    """
+    """把一个账号的 cookie 串解析成 name -> value。同名只保留最后一次出现。
+    不在白名单里的 cookie（如 __ddg*）一律丢弃，交给站点当场重新签发。"""
     seen: Dict[str, str] = {}
     dropped = 0
     for p in s.split(";"):
@@ -220,245 +242,301 @@ def cookie_pairs(s: str) -> Dict[str, str]:
 
 
 def join_cookies(pairs: Dict[str, str]) -> str:
-    """按名字排序拼回 cookie 串。排序是为了让回写前的"有没有变化"比较只反映值的变化，
+    """按名字排序拼回 cookie 串。排序让回写前的"有没有变化"比较只反映值的变化，
     不受 cookie jar 返回顺序影响。"""
     return "; ".join(f"{n}={pairs[n]}" for n in sorted(pairs))
 
 
-def to_playwright_cookies(pairs: Dict[str, str]) -> List[Dict]:
-    """把 name -> value 映射转成 add_cookies 需要的形状。接收已解析的映射而不是原始串，
-    这样每个账号只解析一次，"丢弃瞬态 cookie" 的日志也只打一次。"""
-    return [
-        {"name": n, "value": v, "domain": ".castle-host.com", "path": "/"}
-        for n, v in pairs.items()
-    ]
+# ---- 付款页 Turnstile 相关的注入 JS（原 sb_pay.py，合并进来）----
+# 每段都写成 (function(){...})() 表达式，交给 execute_script 时必须由 js() 补 "return "，
+# 否则一律拿 None 且不抛异常 —— solved() 永远为假、六轮点击白跑、toast 永远读空。
+
+# 是否已拿到 token。优先问站点自己用的 turnstile API，拿不到退回隐藏域。长度阈值 20 挡空值/占位符。
+_SOLVED_JS = """
+(function(){
+    try {
+        if (window.turnstile) {
+            var t = turnstile.getResponse('#cf-turnstile-pay');
+            if (t && t.length > 20) return true;
+        }
+    } catch (e) {}
+    var i = document.querySelector('input[name="cf-turnstile-response"]');
+    return !!(i && i.value && i.value.length > 20);
+})()
+"""
+
+# 控件常被父容器 overflow:hidden 裁掉；逐层放开并把 cloudflare iframe 撑回可见尺寸。
+# 不动父容器 minWidth：本站付款卡片宽度贴着视口，撑开会多出横向滚动条把控件 x 坐标推走。
+_EXPAND_JS = """
+(function() {
+    var anchor = document.querySelector('input[name="cf-turnstile-response"]')
+              || document.querySelector('#cf-turnstile-pay');
+    if (!anchor) return 'no-turnstile';
+    var el = anchor;
+    for (var i = 0; i < 20; i++) {
+        el = el.parentElement;
+        if (!el) break;
+        var s = window.getComputedStyle(el);
+        if (s.overflow === 'hidden' || s.overflowX === 'hidden' || s.overflowY === 'hidden')
+            el.style.overflow = 'visible';
+    }
+    document.querySelectorAll('iframe').forEach(function(f){
+        if (f.src && f.src.includes('challenges.cloudflare.com')) {
+            f.style.width = '300px'; f.style.height = '65px';
+            f.style.minWidth = '300px';
+            f.style.visibility = 'visible'; f.style.opacity = '1';
+        }
+    });
+    return 'done';
+})()
+"""
+
+# 把控件滚进视口中央。付款页 scrollHeight≈1704、#freebtn 在 y≈807，UC 视口只有 ~753 高，
+# 控件默认在折叠线以下；坐标点击点不到就既不报错也拿不到 token。
+_SCROLL_JS = """
+(function(){
+    var box = document.querySelector('#cf-turnstile-pay')
+           || document.querySelector('input[name="cf-turnstile-response"]')
+           || document.querySelector('#freebtn');
+    if (!box) return 'no-anchor';
+    box.scrollIntoView({block: 'center', inline: 'nearest'});
+    var r = box.getBoundingClientRect();
+    return Math.round(r.width) + 'x' + Math.round(r.height)
+         + '@' + Math.round(r.left) + ',' + Math.round(r.top)
+         + ' vh=' + window.innerHeight
+         + ' inview=' + (r.top >= 0 && r.bottom <= window.innerHeight);
+})()
+"""
+
+# 诊断：六轮既不报错也拿不到 token 时，摊开控件真实处境。只取 hostname 不取完整 src（可能带会话参数）。
+_DIAG_JS = """
+(function(){
+    var out = [];
+    var frames = document.querySelectorAll('iframe');
+    out.push('iframes=' + frames.length);
+    for (var i = 0; i < frames.length && i < 6; i++) {
+        var f = frames[i], r = f.getBoundingClientRect(), host = '';
+        try { host = new URL(f.src, location.href).hostname; } catch (e) {}
+        var s = window.getComputedStyle(f);
+        out.push('[' + i + ']' + (host || 'blank')
+                 + ' id=' + (f.id || '-')
+                 + ' ' + Math.round(r.width) + 'x' + Math.round(r.height)
+                 + '@' + Math.round(r.left) + ',' + Math.round(r.top)
+                 + ' vis=' + s.visibility + ' disp=' + s.display);
+    }
+    out.push('pay-box=' + !!document.querySelector('#cf-turnstile-pay'));
+    out.push('turnstile-api=' + !!window.turnstile);
+    out.push('freebtn=' + !!document.querySelector('#freebtn'));
+    out.push('gate=' + !!document.querySelector('#validateModal.show'));
+    return out.join(' | ');
+})()
+"""
 
 
-def build_proxy(raw: str) -> Optional[Dict[str, str]]:
-    """CI 中 CHROME_PROXY 指向本地 sing-box 的 mixed 入站（http://127.0.0.1:8118）。
-    只有浏览器走代理，Telegram / GitHub API 的 aiohttp 请求保持直连。
-    Playwright 不解析 server 串里的内联凭据，须拆成 username / password 字段。"""
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    p = urlsplit(raw if "://" in raw else f"http://{raw}")
+def js(sb, script, label: str = ""):
+    """执行一段 JS 表达式并取回值。必须补 return：Selenium 把脚本当匿名函数体执行，
+    只有 return 出来的值才回传；`(function(){...})()` 直接交给 execute_script 会一律拿 None
+    且不抛异常（最难查）。异常要打出来，吞掉会把故障伪装成"验证码没过"。"""
     try:
-        port = p.port
-    except ValueError:
-        # 不回显原值，避免把带凭据的代理串写进 Actions 日志
-        raise ValueError("CHROME_PROXY 端口非法，需形如 http://127.0.0.1:8118") from None
-    if not p.hostname:
-        raise ValueError("CHROME_PROXY 格式非法，需形如 http://127.0.0.1:8118")
-    cfg = {"server": f"{p.scheme}://{p.hostname}:{port}" if port else f"{p.scheme}://{p.hostname}"}
-    if p.username:
-        cfg["username"] = unquote(p.username)
-    if p.password:
-        cfg["password"] = unquote(p.password)
-    return cfg
-
-
-async def read_json_response(response) -> Optional[dict]:
-    """站点接口以 text/html 返回 JSON，且正文前带 \\r\\n，需容错解析。"""
-    try:
-        return await response.json()
-    except Exception:
-        pass
-    try:
-        return json.loads((await response.text()).strip())
-    except Exception:
+        return sb.execute_script("return " + script.strip())
+    except Exception as e:
+        logger.warning(f"🧩 JS 执行失败{'（' + label + '）' if label else ''}: {e}")
         return None
 
 
 class Notifier:
+    """Telegram 通知。用 requests 同步直连，不走浏览器代理（隧道挂掉不影响通知）。"""
+
     def __init__(self, token: Optional[str], chat_id: Optional[str]):
         self.token, self.chat_id = token, chat_id
 
-    async def send_photo(self, caption: str, photo_path: str) -> Optional[int]:
+    def send_photo(self, caption: str, photo_path: str) -> Optional[int]:
         if not self.token or not self.chat_id:
             return None
         if not photo_path or not Path(photo_path).exists():
-            return await self.send(caption)
+            return self.send(caption)
         try:
-            async with aiohttp.ClientSession() as session:
-                url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
-                with open(photo_path, 'rb') as photo_file:
-                    data = aiohttp.FormData()
-                    data.add_field('chat_id', self.chat_id)
-                    data.add_field('caption', caption)
-                    data.add_field('photo', photo_file, filename='screenshot.png', content_type='image/png')
-                    async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=60)) as r:
-                        if r.status == 200:
-                            logger.info("✅ 通知已发送（带截图）")
-                            return (await r.json()).get('result', {}).get('message_id')
-                        return await self.send(caption)
+            url = f"https://api.telegram.org/bot{self.token}/sendPhoto"
+            with open(photo_path, "rb") as photo_file:
+                r = requests.post(
+                    url,
+                    data={"chat_id": self.chat_id, "caption": caption},
+                    files={"photo": ("screenshot.png", photo_file, "image/png")},
+                    timeout=60,
+                )
+            if r.status_code == 200:
+                logger.info("✅ 通知已发送（带截图）")
+                return (r.json().get("result") or {}).get("message_id")
+            return self.send(caption)
         except Exception as e:
             logger.error(f"❌ 通知异常: {e}")
-            return await self.send(caption)
+            return self.send(caption)
 
-    async def send(self, msg: str) -> Optional[int]:
+    def send(self, msg: str) -> Optional[int]:
         if not self.token or not self.chat_id:
             return None
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.post(
-                    f"https://api.telegram.org/bot{self.token}/sendMessage",
-                    json={"chat_id": self.chat_id, "text": msg, "disable_web_page_preview": True},
-                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-                ) as r:
-                    if r.status == 200:
-                        logger.info("✅ 通知已发送")
-                        return (await r.json()).get('result', {}).get('message_id')
+            r = requests.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json={"chat_id": self.chat_id, "text": msg, "disable_web_page_preview": True},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if r.status_code == 200:
+                logger.info("✅ 通知已发送")
+                return (r.json().get("result") or {}).get("message_id")
         except Exception as e:
             logger.error(f"❌ 通知异常: {e}")
         return None
 
 
 class GitHubManager:
+    """回写轮换后的 cookie 到仓库 Secret。libsodium sealed box（pynacl）加密，requests 直连。"""
+
     def __init__(self, token: Optional[str], repo: Optional[str]):
         self.token, self.repo = token, repo
-        self.headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"} if token else {}
+        self.headers = ({"Authorization": f"Bearer {token}",
+                         "Accept": "application/vnd.github+json"} if token else {})
 
     @staticmethod
-    async def _err_brief(r) -> str:
-        """截取 GitHub 错误响应正文，用于区分 token 过期 / 权限不足 / 仓库名写错。正文不含 token。"""
+    def _err_brief(r) -> str:
+        """截取 GitHub 错误正文，区分 token 过期 / 权限不足 / 仓库名写错。正文不含 token。"""
         try:
-            return (await r.text())[:200].replace("\n", " ")
+            return (r.text or "")[:200].replace("\n", " ")
         except Exception:
             return ""
 
-    async def update_secret(self, name: str, value: str) -> bool:
+    def update_secret(self, name: str, value: str) -> bool:
         if not self.token or not self.repo:
             return False
         try:
             from nacl import encoding, public
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    f"https://api.github.com/repos/{self.repo}/actions/secrets/public-key",
-                    headers=self.headers
-                ) as r:
-                    if r.status != 200:
-                        # 401/403 通常是 REPO_TOKEN 过期或缺少 Secrets 写权限；静默返回会让回写失败无迹可查
-                        logger.error(f"❌ 取 public-key 失败: HTTP {r.status} {await self._err_brief(r)}")
-                        return False
-                    kd = await r.json()
-                pk = public.PublicKey(kd["key"].encode(), encoding.Base64Encoder())
-                enc = b64encode(public.SealedBox(pk).encrypt(value.encode())).decode()
-                async with s.put(
-                    f"https://api.github.com/repos/{self.repo}/actions/secrets/{name}",
-                    headers=self.headers,
-                    json={"encrypted_value": enc, "key_id": kd["key_id"]}
-                ) as r:
-                    if r.status in [201, 204]:
-                        logger.info(f"✅ Secret {name} 已更新")
-                        return True
-                    logger.error(f"❌ Secret {name} 写入失败: HTTP {r.status} {await self._err_brief(r)}")
+            r = requests.get(
+                f"https://api.github.com/repos/{self.repo}/actions/secrets/public-key",
+                headers=self.headers, timeout=REQUEST_TIMEOUT,
+            )
+            if r.status_code != 200:
+                logger.error(f"❌ 取 public-key 失败: HTTP {r.status_code} {self._err_brief(r)}")
+                return False
+            kd = r.json()
+            pk = public.PublicKey(kd["key"].encode(), encoding.Base64Encoder())
+            enc = b64encode(public.SealedBox(pk).encrypt(value.encode())).decode()
+            r2 = requests.put(
+                f"https://api.github.com/repos/{self.repo}/actions/secrets/{name}",
+                headers=self.headers,
+                json={"encrypted_value": enc, "key_id": kd["key_id"]},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if r2.status_code in (201, 204):
+                logger.info(f"✅ Secret {name} 已更新")
+                return True
+            logger.error(f"❌ Secret {name} 写入失败: HTTP {r2.status_code} {self._err_brief(r2)}")
         except Exception as e:
             logger.error(f"❌ GitHub异常: {e}")
         return False
 
 
 class CastleClient:
-    BASE = "https://cp.castle-host.com"
+    """一个账号的一个 UC 会话。开机与续约都在这里，判定靠 DOM + 状态复核（无响应体可读）。"""
 
-    def __init__(self, ctx: BrowserContext, page: Page, account_idx: int):
-        self.ctx, self.page = ctx, page
+    def __init__(self, sb, account_idx: int):
+        self.sb = sb
         self.account_idx = account_idx
-        # UC 旁路跑完回收的 cookie。非空时优先于 Playwright 侧的副本用于回写：
-        # 旁路里那个会话才是站点最后认的。
-        self.uc_cookies: Dict[str, str] = {}
 
-
-    async def take_screenshot(self, server_id: str, stage: str) -> str:
+    # ---- 基础 ----
+    def take_screenshot(self, server_id: str, stage: str) -> str:
+        """save_screenshot 走 basename + folder，避免把绝对路径当文件名。UC 只截可视区，
+        与旧 Playwright full_page 不同，但足够看清 toast/状态。"""
         try:
             path = screenshot_path(self.account_idx, server_id, stage)
-            await self.page.screenshot(path=path, full_page=True)
-            logger.info("📸 截图已保存")
-            return path
+            folder = os.path.dirname(path) or None
+            self.sb.save_screenshot(os.path.basename(path), folder=folder)
+            if os.path.exists(path):
+                logger.info("📸 截图已保存")
+                return path
+            return ""
         except Exception as e:
             logger.error(f"❌ 截图失败: {e}")
             return ""
 
-    async def dismiss_cookie_banner(self):
-        """cookie 同意横幅在 cookie_consent 缺失时渲染，会遮挡 #freebtn 导致点击被拦截。"""
+    def _body_text(self) -> str:
         try:
-            btn = self.page.locator("#cookieAcceptAll")
-            if await btn.count() > 0 and await btn.first.is_visible():
-                await btn.first.click()
-                await self.page.wait_for_timeout(500)
+            return self.sb.get_text("body")
+        except Exception:
+            return js(self.sb, "document.body ? document.body.innerText : ''", "body") or ""
+
+    def dismiss_cookie_banner(self):
+        """cookie 同意横幅在 cookie_consent 缺失时渲染，会遮挡 #freebtn。"""
+        try:
+            if self.sb.is_element_visible("#cookieAcceptAll"):
+                self.sb.click("#cookieAcceptAll")
+                time.sleep(0.5)
                 logger.info("🍪 已接受 cookie 横幅")
         except Exception:
             pass
 
-    async def captcha_gate_active(self) -> bool:
+    def captcha_gate_active(self) -> bool:
         """全站验证闸门：任意 AJAX 返回 captcha_required 时弹出 #validateModal + Turnstile。"""
         try:
-            return await self.page.locator("#validateModal.show").count() > 0
+            return bool(self.sb.is_element_present("#validateModal.show"))
         except Exception:
             return False
 
-    # castle.js（外部脚本）用 $.ajaxSetup({beforeSend}) 给所有 jQuery AJAX 加 X-CSRF-Token，
-    # token 取自 meta[name="csrf-token"]，且只在非空时才加这个头；
-    # 而 window.ServersID、freePay 是内联的：只等内联信号就动手，可能赶在 castle.js 执行前，
-    # 此时请求不带 token，站点一律回 "Ошибка валидации запроса!"。
+    # castle.js（外链）用 $.ajaxSetup({beforeSend}) 给所有 jQuery AJAX 加 X-CSRF-Token，
+    # 且只在 meta token 非空时才加。内联的 sendAction/freePay 可能赶在 castle.js 执行前触发，
+    # 请求不带 token，站点一律回 "Ошибка валидации запроса!"。所以动作前必须等这条链就绪。
     CSRF_READY = (
         "!!(window.jQuery && jQuery.ajaxSettings"
         " && typeof jQuery.ajaxSettings.beforeSend === 'function'"
         " && (document.querySelector('meta[name=\"csrf-token\"]') || {}).content)"
     )
 
-    async def wait_csrf_ready(self) -> bool:
-        """等 CSRF 注入链就绪。任何状态变更请求之前都必须先过这一关。"""
-        try:
-            await self.page.wait_for_function(self.CSRF_READY, timeout=20000)
-            return True
-        except Exception:
-            meta_len = await self.page.evaluate(
-                "((document.querySelector('meta[name=\"csrf-token\"]') || {}).content || '').length"
-            )
-            has_hook = await self.page.evaluate(
-                "!!(window.jQuery && jQuery.ajaxSettings"
-                " && typeof jQuery.ajaxSettings.beforeSend === 'function')"
-            )
-            # 只记长度和布尔值，绝不打印 token 本身
-            logger.warning(f"⚠️ CSRF 注入链未就绪: meta长度={meta_len} 全局beforeSend={has_hook}")
-            return False
+    def wait_csrf_ready(self) -> bool:
+        """轮询等 CSRF 注入链就绪（最多 20 秒）。任何状态变更请求前都要先过这一关。"""
+        for _ in range(40):
+            try:
+                if self.sb.execute_script("return " + self.CSRF_READY):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        # 只记长度和布尔值，绝不打印 token 本身
+        meta_len = js(self.sb,
+                      "((document.querySelector('meta[name=\"csrf-token\"]') || {}).content || '').length",
+                      "meta")
+        has_hook = js(self.sb,
+                      "!!(window.jQuery && jQuery.ajaxSettings"
+                      " && typeof jQuery.ajaxSettings.beforeSend === 'function')",
+                      "hook")
+        logger.warning(f"⚠️ CSRF 注入链未就绪: meta长度={meta_len} 全局beforeSend={has_hook}")
+        return False
 
-    async def log_request_csrf(self, response) -> None:
-        """状态变更请求被拒时，需要能区分"没带 token"和"带了但站点不认"。"""
-        try:
-            headers = await response.request.all_headers()
-            token = headers.get("x-csrf-token", "")
-            logger.info(
-                f"🔎 请求诊断: HTTP={response.status} "
-                f"X-CSRF-Token长度={len(token)} 闸门={await self.captcha_gate_active()}"
-            )
-        except Exception:
-            pass
+    def goto_servers(self):
+        """打开 /servers 并等就绪信号（ServersID 已定义），再过 CSRF、点掉 cookie 横幅。"""
+        self.sb.uc_open_with_reconnect(f"{BASE}/servers", RECONNECT)
+        for _ in range(30):
+            try:
+                if self.sb.execute_script("return Array.isArray(window.ServersID)"):
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        self.wait_csrf_ready()
+        self.dismiss_cookie_banner()
 
-    async def goto_servers(self):
-        # 页面每 60 秒轮询 /main/index/getstatus/online，networkidle 可能迟迟等不到，
-        # 改为等具体就绪信号（ServersID 已定义）。
-        await self.page.goto(f"{self.BASE}/servers", wait_until="domcontentloaded")
+    # ---- 服务器发现与运行状态 ----
+    def get_server_ids(self) -> List[str]:
+        """从服务器列表页获取服务器 ID。正则抓 `var ServersID = [...]`，再依次回退
+        window.ServersID 和页面链接里的数字 ID。"""
         try:
-            await self.page.wait_for_function("Array.isArray(window.ServersID)", timeout=15000)
-        except Exception:
-            await self.page.wait_for_timeout(2000)
-        await self.wait_csrf_ready()
-        await self.dismiss_cookie_banner()
-
-    async def get_server_ids(self) -> List[str]:
-        """从服务器列表页获取服务器ID"""
-        try:
-            await self.goto_servers()
-            html = await self.page.content()
+            self.goto_servers()
+            html = self.sb.get_page_source()
             match = re.search(r'var\s+ServersID\s*=\s*\[([\d,\s]+)\]', html)
             ids = [x.strip() for x in match.group(1).split(",") if x.strip()] if match else []
             if not ids:
-                try:
-                    ids = [str(x) for x in await self.page.evaluate(
-                        "Array.isArray(window.ServersID) ? window.ServersID.map(String) : []")]
-                except Exception:
-                    ids = []
+                arr = js(self.sb,
+                         "Array.isArray(window.ServersID) ? window.ServersID.map(String) : []",
+                         "serverids")
+                ids = [str(x) for x in (arr or [])]
             if not ids:
                 ids = sorted(set(re.findall(
                     r'/servers/(?:pay/index|control/index|getData)/(\d{4,8})', html)))
@@ -470,48 +548,48 @@ class CastleClient:
             logger.error(f"❌ 获取服务器ID失败: {e}")
         return []
 
-    async def check_server_stopped(self, sid: str) -> Optional[bool]:
-        """关机时控制区渲染 start 按钮，运行时渲染 stop（icon-server-bwork）。
-        只按 onclick 判断，不依赖图标 class，避免站点换类名后再次失效。
+    def check_server_stopped(self, sid: str) -> Optional[bool]:
+        """关机时控制区渲染 start 按钮。只按 onclick 是否含 (sid,'start' 判断，不依赖图标 class。
         判定失败返回 None，不能当成"在运行"——那样每日强停后会静默跳过启动。"""
         try:
-            return await self.page.evaluate(
-                """(sid) => [...document.querySelectorAll('[onclick]')].some(e => {
-                    const s = (e.getAttribute('onclick') || '').replace(/\\s+/g, '');
+            return self.sb.execute_script(
+                """var sid = arguments[0];
+                return [...document.querySelectorAll('[onclick]')].some(function(e){
+                    var s = (e.getAttribute('onclick') || '').replace(/\\s+/g, '');
                     return s.includes('(' + sid + ",'start'") || s.includes('(' + sid + ',"start"');
-                })""",
-                sid
+                });""",
+                sid,
             )
         except Exception as e:
             logger.warning(f"⚠️ 服务器 {mask_id(sid)} 运行状态判定失败: {e}")
             return None
 
-    async def _dispatch_action(self, sid: str, action: str) -> bool:
-        """/servers 导出 sendAction，服务器详情页导出 sendActionStatus，签名一致。
+    def _dispatch_action(self, sid: str, action: str) -> bool:
+        """/servers 导出 sendAction，详情页导出 sendActionStatus，签名一致。
         调用页面自身函数以复用站点的 X-CSRF-Token 注入（$.ajaxSettings.beforeSend）。"""
         if not sid.isdigit() or not action.isalpha():
             raise ValueError(f"非法参数: sid={sid!r} action={action!r}")
-        fn = await self.page.evaluate(
-            "typeof window.sendAction === 'function' ? 'sendAction'"
+        fn = self.sb.execute_script(
+            "return typeof window.sendAction === 'function' ? 'sendAction'"
             " : (typeof window.sendActionStatus === 'function' ? 'sendActionStatus' : '')"
         )
         if not fn:
             return False
-        await self.page.evaluate(f"{fn}({sid}, '{action}')")
+        # sid 已 isdigit、action 已 isalpha 校验，无注入面
+        self.sb.execute_script(f"return {fn}({sid}, '{action}')")
         return True
 
-    async def ensure_running(self, sid: str, allow_start: bool = True) -> Tuple[StartStatus, str]:
-        """确认服务器在运行，必要时调用页面 JS 函数启动。
-
-        站点每天 0-1 点（莫斯科时间）强停免费服务器，所以这是每次运行的主要目的之一。
-        续约前后各调用一次：前一次负责拉起，后一次负责复核。allow_start=False 用于复核，
-        避免对同一台机器重复下启动指令。"""
+    def ensure_running(self, sid: str, allow_start: bool = True) -> Tuple[StartStatus, str]:
+        """确认服务器在运行，必要时调用页面 JS 启动。无响应体可读，判定靠状态翻转：
+        下指令 → 等 → 重载 /servers → 复核 check_server_stopped 是否由 true 翻 false。
+        续约前后各调一次；allow_start=False 用于复核，避免重复下指令。"""
         masked = mask_id(sid)
         try:
-            if "/servers" not in self.page.url or "/control" in self.page.url or "/pay" in self.page.url:
-                await self.goto_servers()
+            url = self.sb.get_current_url() or ""
+            if "/servers" not in url or "/control" in url or "/pay" in url:
+                self.goto_servers()
 
-            stopped = await self.check_server_stopped(sid)
+            stopped = self.check_server_stopped(sid)
             if stopped is None:
                 return StartStatus.UNKNOWN, "运行状态判定失败"
             if not stopped:
@@ -522,366 +600,278 @@ class CastleClient:
                 return StartStatus.STOPPED, "启动指令已发出，面板仍显示关机"
 
             logger.info(f"🔴 服务器 {masked} 已关机，正在启动...")
+            if not self.wait_csrf_ready():
+                return StartStatus.FAILED, "会话未携带 CSRF token（Cookie 可能已失效）"
+            logger.info("🔄 发送启动指令...")
+            if not self._dispatch_action(sid, "start"):
+                logger.warning("⚠️ 页面未导出 sendAction/sendActionStatus，回退为点击按钮")
+                try:
+                    self.sb.click(f'[onclick*="{sid}"][onclick*="start"]')
+                except Exception as e:
+                    logger.warning(f"回退点击失败: {e}")
+            time.sleep(5)
 
-            response_data = {}
+            # 重载前先读 toast：被判定会话的 start POST 会回 Ошибка валидации запроса!，
+            # 导航走了 toast 就没了。
+            tmsg = self.toast_text()
+            if self.captcha_gate_active():
+                logger.warning("🤖 启动被验证码闸门拦截")
+                return StartStatus.CAPTCHA, tmsg or "需人工过验证码"
 
-            async def handle_response(response):
-                if "/servers/control/action/" in response.url and "/start" in response.url:
-                    data = await read_json_response(response)
-                    if data is not None:
-                        response_data['result'] = data
-                        logger.info(f"📡 启动API响应: {data}")
-                        await self.log_request_csrf(response)
-
-            self.page.on("response", handle_response)
-            try:
-                logger.info("🔄 发送启动指令...")
-                if not await self.wait_csrf_ready():
-                    return StartStatus.FAILED, "会话未携带 CSRF token（Cookie 可能已失效）"
-                if not await self._dispatch_action(sid, 'start'):
-                    logger.warning("⚠️ 页面未导出 sendAction/sendActionStatus，回退为点击按钮")
-                    await self.page.locator(f'[onclick*="{sid}"][onclick*="start"]').first.click()
-                await self.page.wait_for_timeout(5000)
-            finally:
-                self.page.remove_listener("response", handle_response)
-
-            result = response_data.get('result') or {}
-            status = result.get('status')
-
-            if status == 'captcha_required':
-                err = result.get('error', '') or "需人工过验证码"
-                logger.warning(f"🤖 启动被验证码闸门拦截: {err}")
-                return StartStatus.CAPTCHA, err
-            if status == 'success':
-                logger.info(f"🟢 服务器 {masked} 启动指令已接受")
-                await self.page.wait_for_timeout(3000)
-                await self.goto_servers()
+            self.goto_servers()
+            stopped2 = self.check_server_stopped(sid)
+            if stopped2 is False:
+                logger.info(f"🟢 服务器 {masked} 已启动")
                 return StartStatus.STARTED, ""
-            if status == 'error':
-                err = result.get('error', '未知错误')
-                logger.warning(f"⚠️ 启动失败: {err}")
-                return StartStatus.FAILED, err
-            logger.warning("⚠️ 启动响应未知")
-            return StartStatus.FAILED, "启动指令无响应"
+            if stopped2 is None:
+                return StartStatus.UNKNOWN, "运行状态判定失败"
+            if tmsg:
+                _, m = classify_renew_error(tmsg)
+                logger.warning(f"⚠️ 启动失败: {m}")
+                return StartStatus.FAILED, m
+            logger.warning(f"🟡 服务器 {masked} 启动指令已发出，面板仍显示关机")
+            return StartStatus.STOPPED, "启动指令已发出，面板仍显示关机"
         except Exception as e:
             logger.error(f"❌ 启动服务器 {masked} 失败: {e}")
             return StartStatus.FAILED, str(e)
 
-    async def _renew_via_uc(self, sid: str, expiry: str,
-                            days: int) -> Tuple[RenewalStatus, str, str, str, int]:
-        """付款页开启 Turnstile 时的旁路：交给 sb_pay.py 子进程用 UC 模式过验证并点续约。
+    # ---- 付款页 Turnstile（原 sb_pay.py 的三段结构）----
+    def solved(self) -> bool:
+        return bool(js(self.sb, _SOLVED_JS, "solved"))
 
-        Playwright 过不了 Turnstile（连接常驻、navigator.webdriver 为真、CDP 可探测），
-        UC 模式靠点击瞬间断开 webdriver + 操作系统鼠标才能过，两者不能混在一个浏览器里。
-
-        任何一步不成都退回今天的 CAPTCHA_REQUIRED 语义 —— 旁路只增加成功的可能，
-        不允许让原本"需人工"的结果变成误报的"失败"。
-        """
-        masked = mask_id(sid)
-        fallback = (RenewalStatus.CAPTCHA_REQUIRED, "付款页需通过 Turnstile 验证码",
-                    await self.take_screenshot(sid, "captcha"), expiry, days)
-
-        cookie_str = await self.extract_cookies()
-        if not cookie_str:
-            logger.error("❌ UC 旁路取不到当前会话 cookie")
-            return fallback
-        # extract_cookies() 只回收站点当前认的项，cookie_consent 可能已被站点清掉。
-        # 交给 UC 会话前用 cookie_pairs() 补回默认值，否则同意横幅会盖住 #freebtn。
-        # 这里复用同一个解析函数而不另写一份：输入已无瞬态项，不会重复打"已丢弃"日志。
-        uc_pairs = cookie_pairs(cookie_str)
-        # 只打名字不打值。缺 PHPSESSID 就意味着 UC 会话是未登录态，值得当场看见
-        logger.info(f"🍪 交给 UC 会话的 cookie: {','.join(sorted(uc_pairs))}")
-        cookie_str = join_cookies(uc_pairs)
-        if not SB_PAY_SCRIPT.exists():
-            logger.error(f"❌ 找不到 {SB_PAY_SCRIPT.name}")
-            return fallback
-
-        ensure_output_dir()
-        shot = screenshot_path(self.account_idx, sid, "uc")
-        # 结果文件名从截图路径派生：那份已经过 mask_id 脱敏并带时间戳，
-        # 直接拿 sid 拼会把完整 ID 写进日志里的路径。
-        out = str(Path(shot).with_suffix(".json"))
-        env = {**os.environ,
-               SB_PAY_COOKIE_ENV: cookie_str,
-               SB_PAY_PROXY_ENV: os.environ.get("CHROME_PROXY", "")}
-
+    def click_captcha(self) -> str:
+        """点一次验证码，返回实际走的定位方式（只为日志可读）。先按 PAY_FRAME，异常退回默认。"""
         try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, str(SB_PAY_SCRIPT),
-                "--sid", sid, "--masked", masked, "--shot", shot, "--out", out,
-                env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=SB_PAY_TIMEOUT)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                logger.error(f"❌ UC 旁路超时（{SB_PAY_TIMEOUT}s）")
-                return fallback
+            self.sb.uc_gui_click_captcha(frame=PAY_FRAME)
+            return f"frame={PAY_FRAME}"
         except Exception as e:
-            logger.error(f"❌ UC 旁路启动失败: {e}")
-            return fallback
-
-        # 子进程的日志只转印带 [uc] 前缀的行：SeleniumBase 本身很啰嗦，全转会淹掉主日志
-        for line in (stdout or b"").decode("utf-8", "replace").splitlines():
-            if "[uc]" in line:
-                logger.info(f"🧩 {line.strip()}")
-
+            logger.info(f"🧩 按 {PAY_FRAME} 定位失败({e})，退回默认 iframe")
         try:
-            with open(out, encoding="utf-8") as f:
-                data = json.load(f)
+            self.sb.uc_gui_click_captcha()
+            return "frame=iframe(默认)"
         except Exception as e:
-            logger.error(f"❌ UC 旁路结果读取失败: {e}")
-            return fallback
-        finally:
-            try:
-                os.remove(out)
-            except OSError:
-                pass
+            return f"两种定位均异常: {e}"
 
-        return self._map_uc_result(data, masked, shot, expiry, days, fallback)
+    def handle_pay_turnstile(self) -> bool:
+        """先看是否静默通过（managed 模式常自己就过，省掉会白点六轮）→ 解除裁剪 → 最多 6 轮点击。"""
+        time.sleep(2)
+        if self.solved():
+            logger.info("🧩 turnstile 已静默通过")
+            return True
 
-    def _map_uc_result(self, data: Dict, masked: str, shot: str, expiry: str,
-                       days: int, fallback: Tuple) -> Tuple[RenewalStatus, str, str, str, int]:
-        """把 sb_pay.py 的返回值映射成续约结果。sb_pay 只回普通字符串，枚举映射留在这里，
-        它就不必反向 import 本模块（本模块以 __main__ 运行，import 会得到第二份实例）。"""
-        outcome = data.get("outcome", "")
-        shot = data.get("screenshot") or shot
-        if not os.path.exists(shot):
-            shot = ""
+        expanded = None
+        for _ in range(3):
+            expanded = js(self.sb, _EXPAND_JS, "expand")
+            time.sleep(0.5)
+        logger.info(f"🧩 解除裁剪: {expanded}")
+        logger.info(f"🧩 诊断: {js(self.sb, _DIAG_JS, 'diag')}")
 
-        # 旁路会话可能已换到新的 PHPSESSID，回写时要用它，否则下次运行拿着旧会话
-        cookies = {k: v for k, v in (data.get("cookies") or {}).items()
-                   if k in PERSISTENT_COOKIE_NAMES}
-        if cookies:
-            self.uc_cookies = cookies
+        for attempt in range(1, SOLVE_ROUNDS + 1):
+            if self.solved():
+                logger.info(f"🧩 turnstile 已通过（第 {attempt - 1} 轮后）")
+                return True
+            # 每轮都重新滚：点击、页面重排都可能把控件再挪出视口
+            logger.info(f"🧩 第 {attempt}/{SOLVE_ROUNDS} 轮 滚动 {js(self.sb, _SCROLL_JS, 'scroll')}")
+            logger.info(f"🧩   点击 -> {self.click_captcha()}")
+            for _ in range(POLL_SECONDS * 2):
+                time.sleep(0.5)
+                if self.solved():
+                    logger.info(f"🧩 turnstile 已通过（第 {attempt} 轮）")
+                    return True
 
-        # 复核付款页读回的正文：到期日以它为准，比点击前的旧值新
-        new_expiry, new_days = parse_expiry(data.get("page_text") or "")
-        if new_expiry:
-            expiry, days = new_expiry, new_days
+        logger.warning(f"🧩 turnstile {SOLVE_ROUNDS} 轮均未通过")
+        logger.warning(f"🧩 收尾诊断: {js(self.sb, _DIAG_JS, 'diag')}")
+        return False
 
-        if outcome == "success":
-            logger.info(f"📝 结果: ✅ 服务器 {masked} 经验证码后续约成功")
-            return RenewalStatus.SUCCESS, "续约成功（已过验证码）", shot, expiry, days
+    def toast_text(self) -> str:
+        """站点续约/开机结果都经 iziToast 呈现；UC 无响应拦截，只能读它。可能同时多条或一条都没有，
+        JS 一次拿全、缺失时返回空串。"""
+        return js(self.sb, """
+            Array.from(document.querySelectorAll('.iziToast-message'))
+                .map(function(e){ return (e.textContent || '').trim(); })
+                .filter(Boolean).join(' | ')
+        """, "toast") or ""
 
-        if outcome == "captcha":
-            logger.warning("📝 结果: Turnstile 自动过验证失败")
-            return (RenewalStatus.CAPTCHA_REQUIRED, "付款页 Turnstile 自动过验证失败",
-                    shot, expiry, days)
+    # ---- 续约 ----
+    def _reload_expiry(self, pay_url: str) -> Tuple[str, int]:
+        """重载付款页读回到期日。UC 无响应体，续约成败的硬判据就是这个日期有没有前移。"""
+        try:
+            self.sb.uc_open_with_reconnect(pay_url, RELOAD_RECONNECT)
+            return parse_expiry(self._body_text())
+        except Exception as e:
+            logger.warning(f"复核付款页失败: {e}")
+            return "", 0
 
-        if outcome == "blocked":
-            logger.warning("📝 结果: 会话被全站验证闸门锁定")
-            return (RenewalStatus.CAPTCHA_REQUIRED, "会话需通过 Turnstile 验证",
-                    shot, expiry, days)
-
-        toast = data.get("toast") or ""
-        if not toast:
-            # 既没 toast 也没成功标志，说明旁路本身没跑到点击结果，按"需人工"处理更诚实
-            logger.warning("📝 结果: UC 旁路未取到站点响应")
-            return (fallback[0], fallback[1], shot or fallback[2], expiry, days)
-
-        status, msg = classify_renew_error(toast)
-        logger.info(f"📝 结果: {msg}")
-        return status, msg, shot, expiry, days
-
-    async def renew(self, sid: str) -> Tuple[RenewalStatus, str, str, str, int]:
-        """续约服务器"""
-
+    def renew(self, sid: str) -> Tuple[RenewalStatus, str, str, str, int]:
+        """续约。付款页开 Turnstile 就先 UC 过验证，再点 #freebtn，
+        用"到期日前移"（硬）+ toast（辅）判成败。"""
         masked = mask_id(sid)
-        screenshot_file = ""
-        expiry = ""
-        days = 0
-
+        screenshot_file, expiry, days = "", "", 0
+        pay_url = f"{BASE}/servers/pay/index/{sid}"
         try:
             logger.info("📄 访问续约页面...")
-            await self.page.goto(f"{self.BASE}/servers/pay/index/{sid}", wait_until="domcontentloaded")
-            # #freebtn 的 onclick 调用页面内 freePay()，等它就绪比等 networkidle 可靠。
-            try:
-                await self.page.wait_for_function("typeof window.freePay === 'function'", timeout=15000)
-            except Exception:
-                await self.page.wait_for_timeout(2000)
-            await self.wait_csrf_ready()
-            await self.dismiss_cookie_banner()
+            self.sb.uc_open_with_reconnect(pay_url, RECONNECT)
+            for _ in range(30):
+                try:
+                    if self.sb.execute_script("return typeof window.freePay === 'function'"):
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            self.wait_csrf_ready()
+            self.dismiss_cookie_banner()
 
-            content = await self.page.text_content("body")
-            expiry, days = parse_expiry(content)
+            expiry, days = parse_expiry(self._body_text())
             if expiry:
                 logger.info(f"📅 到期: {convert_date(expiry)} ({days}天)")
 
-            # 站点改版新增：服务端用 `const showCaptcha = true` 打开付款页 Turnstile。
-            # 开启时 freePay() 会先取 turnstile.getResponse()，取不到就只弹 toast 而不发请求，
-            # Playwright 点下去拿不到任何响应。此时交给 UC 模式旁路（sb_pay.py）真实鼠标过验证。
-            if re.search(r'const\s+showCaptcha\s*=\s*true', await self.page.content()) or FORCE_SB_PAY:
-                logger.warning("🤖 付款页已开启 Turnstile 验证码，转 UC 模式处理")
-                return await self._renew_via_uc(sid, expiry, days)
+            # #cf-turnstile-pay 存在才过验证。showCaptcha 按会话现算，UC 会话常拿到假：
+            # 没控件就直接点 #freebtn，硬跑六轮只会白等 70 秒再误报"验证码没过"。
+            if self.sb.is_element_present(PAY_FRAME):
+                logger.warning("🤖 付款页已开启 Turnstile 验证码，UC 模式过验证")
+                if not self.handle_pay_turnstile():
+                    screenshot_file = self.take_screenshot(sid, "captcha")
+                    return (RenewalStatus.CAPTCHA_REQUIRED, "付款页 Turnstile 自动过验证失败",
+                            screenshot_file, expiry, days)
+            else:
+                logger.info("付款页未渲染 Turnstile 控件，无需过验证")
 
-
-            if await self.captcha_gate_active():
+            if self.captcha_gate_active():
                 logger.warning("🤖 会话已被验证码闸门锁定")
-                screenshot_file = await self.take_screenshot(sid, "captcha")
+                screenshot_file = self.take_screenshot(sid, "captcha")
                 return (RenewalStatus.CAPTCHA_REQUIRED, "会话需通过 Turnstile 验证",
                         screenshot_file, expiry, days)
 
-            renew_btn = self.page.locator('#freebtn')
-            if await renew_btn.count() == 0:
+            if not self.sb.is_element_present("#freebtn"):
                 logger.error("❌ 找不到续约按钮")
-                screenshot_file = await self.take_screenshot(sid, "no_button")
+                screenshot_file = self.take_screenshot(sid, "no_button")
                 return RenewalStatus.FAILED, "找不到续约按钮", screenshot_file, expiry, days
 
-            # castle.js 的 $.ajaxSetup(beforeSend) 只在 token 非空时才加 X-CSRF-Token 头，
-            # token 缺失时点下去必然换回"请求校验失败"，不如直接报会话问题。
-            if not await self.wait_csrf_ready():
-                screenshot_file = await self.take_screenshot(sid, "no_csrf")
+            if not self.wait_csrf_ready():
+                screenshot_file = self.take_screenshot(sid, "no_csrf")
                 return (RenewalStatus.FAILED, "会话未携带 CSRF token（Cookie 可能已失效）",
                         screenshot_file, expiry, days)
 
-            response_data = {}
+            # 点按钮而不是自发请求：freePay() 读 turnstile token，castle.js 补 X-CSRF-Token
+            logger.info(f"🖱️ 服务器 {masked} 已请求续约")
+            self.sb.click("#freebtn")
+            for _ in range(POLL_SECONDS * 2):
+                time.sleep(0.5)
+                if self.sb.is_element_visible(".iziToast-message"):
+                    break
+            toast = self.toast_text()
+            logger.info(f"🔔 toast: {toast or '(空)'}")
+            screenshot_file = self.take_screenshot(sid, "renew")
 
-            async def handle_response(response):
-                if "/servers/pay/buy_months/" in response.url:
-                    data = await read_json_response(response)
-                    if data is not None:
-                        response_data['result'] = data
-                        await self.log_request_csrf(response)
+            # 判定：到期日前移是硬判据（重载复核），toast 为辅
+            new_expiry, new_days = self._reload_expiry(pay_url)
+            if new_expiry:
+                if expiry_advanced(expiry, new_expiry):
+                    logger.info("📝 结果: ✅ 续约成功（到期日已前移）")
+                    return RenewalStatus.SUCCESS, "续约成功", screenshot_file, new_expiry, new_days
+                expiry, days = new_expiry, new_days
 
-            self.page.on("response", handle_response)
-            try:
-                logger.info(f"🖱️ 服务器 {masked} 已请求续约")
-                await renew_btn.click()
-                await self.page.wait_for_timeout(3000)
-            finally:
-                self.page.remove_listener("response", handle_response)
-
-            data = response_data.get('result') or {}
-
-            if data.get("status") == "captcha_required":
-                logger.warning(f"📝 结果: 需要验证码 - {data.get('error', '')}")
-                screenshot_file = await self.take_screenshot(sid, "captcha")
-                return (RenewalStatus.CAPTCHA_REQUIRED, data.get("error") or "需通过 Turnstile 验证",
-                        screenshot_file, expiry, days)
-
-            if data.get("status") == "success":
-                logger.info(f"📝 结果: ✅ 续约成功")
-                await self.page.wait_for_timeout(1000)
-                screenshot_file = await self.take_screenshot(sid, "success")
+            if "успешно" in toast.lower():
+                logger.info("📝 结果: ✅ 续约成功（toast）")
                 return RenewalStatus.SUCCESS, "续约成功", screenshot_file, expiry, days
 
-            success_toast = self.page.locator('.iziToast-message:has-text("Успешно")')
-            if await success_toast.count() > 0:
-                logger.info(f"📝 结果: ✅ 续约成功")
-                screenshot_file = await self.take_screenshot(sid, "success")
-                return RenewalStatus.SUCCESS, "续约成功", screenshot_file, expiry, days
-
-            if data.get("status") == "error":
-                status, msg = classify_renew_error(data.get("error", ""))
+            if toast:
+                status, msg = classify_renew_error(toast)
                 logger.info(f"📝 结果: {msg}")
-                stage = "limited" if status is RenewalStatus.RATE_LIMITED else "failed"
-                screenshot_file = await self.take_screenshot(sid, stage)
                 return status, msg, screenshot_file, expiry, days
 
-
-            if not data and await self.captcha_gate_active():
+            if self.captcha_gate_active():
                 logger.warning("📝 结果: 点击后被验证码闸门拦截")
-                screenshot_file = await self.take_screenshot(sid, "captcha")
                 return (RenewalStatus.CAPTCHA_REQUIRED, "会话需通过 Turnstile 验证",
                         screenshot_file, expiry, days)
 
-            logger.info(f"📝 结果: 未知响应")
-            screenshot_file = await self.take_screenshot(sid, "unknown")
-            return RenewalStatus.FAILED, str(data) if data else "无响应", screenshot_file, expiry, days
+            logger.info("📝 结果: 无响应")
+            return RenewalStatus.FAILED, "无响应", screenshot_file, expiry, days
 
         except Exception as e:
             logger.error(f"❌ 续约服务器 {masked} 异常: {e}")
-            screenshot_file = await self.take_screenshot(sid, "exception")
+            screenshot_file = self.take_screenshot(sid, "exception")
             return RenewalStatus.FAILED, str(e), screenshot_file, expiry, days
 
-    async def extract_cookies(self) -> Optional[str]:
-        """只取回值得跨运行保留的 cookie。DDoS-Guard 的 __ddg* 等瞬态项不回写：
-        它们与出口 IP、签发时刻绑定，下次运行重放旧值可能让 POST 被判成非法请求。
-
-        同名 cookie 可能同时存在两份：我们注入的 .castle-host.com 和站点自己下发的
-        cp.castle-host.com。后者才是站点当前认的值，所以让 host-only 的那份覆盖。"""
+    def extract_cookies(self) -> Optional[str]:
+        """只取回值得跨运行保留的 cookie。同名可能两份：注入的 .castle-host.com 和站点下发的
+        cp.castle-host.com，后者才是站点当前认的值，让 host-only 那份覆盖。"""
         try:
-            all_cookies = await self.ctx.cookies()
-            # 只打名字不打值。站点 2026 年改版后到底发哪些 cookie、会话靠哪一个，
-            # 只有这一行能看出来 —— 白名单漏了新的会话 cookie 会静默丢会话。
+            all_cookies = self.sb.get_cookies()
             names = sorted({c["name"] for c in all_cookies
-                            if "castle-host.com" in c.get("domain", "")})
+                            if "castle-host.com" in (c.get("domain") or "")})
             logger.info(f"🍪 站点当前下发: {','.join(names) or '(空)'}")
-            cc = [
-                c for c in all_cookies
-                if "castle-host.com" in c.get("domain", "") and c["name"] in PERSISTENT_COOKIE_NAMES
-            ]
-            cc.sort(key=lambda c: c.get("domain", "").startswith("."), reverse=True)
+            cc = [c for c in all_cookies
+                  if "castle-host.com" in (c.get("domain") or "")
+                  and c.get("name") in PERSISTENT_COOKIE_NAMES]
+            cc.sort(key=lambda c: (c.get("domain") or "").startswith("."), reverse=True)
             pairs = {c["name"]: c["value"] for c in cc}
             return join_cookies(pairs) if pairs else None
         except Exception:
             return None
 
 
-async def process_account(cookie_str: str, idx: int, notifier: Notifier,
-                          proxy: Optional[Dict[str, str]] = None) -> Tuple[Optional[str], List[ServerResult]]:
+def process_account(cookie_str: str, idx: int, notifier: Notifier,
+                    proxy: Optional[str] = None) -> Tuple[Optional[str], List[ServerResult]]:
+    """处理一个账号：起一个 UC 会话，注 cookie，逐台服务器开机 + 续约 + 复核，推通知，回收 cookie。"""
+    from seleniumbase import SB   # 只有跑到这里才需要这个依赖
+
     pairs = cookie_pairs(cookie_str)
-    cookies = to_playwright_cookies(pairs)
-    if not cookies:
+    if not pairs:
         logger.error(f"❌ 账号#{idx + 1} Cookie解析失败")
         return None, []
 
-    logger.info(f"{'=' * 50}")
+    logger.info("=" * 50)
     logger.info(f"📌 处理账号 #{idx + 1}")
+    now = lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    async with async_playwright() as p:
-        # 代理挂在 launch 层：Chromium 以 --proxy-server 全局生效，页面导航与站内 XHR 一并走隧道
-        launch_kwargs = {"headless": True, "args": ["--no-sandbox"]}
-        if proxy:
-            launch_kwargs["proxy"] = proxy
-            logger.info(f"🌐 浏览器经代理出网: {proxy['server']}")
-        browser = await p.chromium.launch(**launch_kwargs)
-        ctx = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1920, "height": 1080}
-        )
-        await ctx.add_cookies(cookies)
-        page = await ctx.new_page()
-        page.set_default_timeout(PAGE_TIMEOUT)
-        client = CastleClient(ctx, page, idx)
-        results: List[ServerResult] = []
+    kwargs = {"uc": True, "headless": False}   # UC 在 headless 下可被检测，显示由 xvfb 提供
+    if proxy:
+        kwargs["proxy"] = proxy
+        logger.info("🌐 浏览器经代理出网")   # 不打印地址：仓库公开，Actions 日志同样公开
 
+    results: List[ServerResult] = []
+    with SB(**kwargs) as sb:
+        # 窗口撑满 xvfb 的 1920x1080：视口越高控件越可能一开始就在折叠线以上
         try:
-            server_ids = await client.get_server_ids()
+            sb.maximize_window()
+        except Exception as e:
+            logger.warning(f"最大化窗口失败: {e}")
+
+        # 先落到域名下才能注 cookie（Selenium 不允许给当前域之外的域设 cookie）
+        sb.uc_open_with_reconnect(f"{BASE}/servers", RECONNECT)
+        sb.add_cookies(
+            [{"name": n, "value": v, "domain": ".castle-host.com", "path": "/"}
+             for n, v in pairs.items()],
+            expiry=False,
+        )
+        logger.info(f"🍪 已注入 cookie: {','.join(sorted(pairs))}")
+
+        client = CastleClient(sb, idx)
+        try:
+            server_ids = client.get_server_ids()
             if not server_ids:
-                if "login" in page.url:
+                if "login" in (sb.get_current_url() or ""):
                     logger.error(f"❌ 账号#{idx + 1} Cookie已失效")
-                    error_screenshot = await client.take_screenshot("login", "expired")
-                    await notifier.send_photo(
-                        f"❌ Castle-Host 账号#{idx + 1}\n\nCookie已失效，请更新\n\n"
-                        f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                        error_screenshot
-                    )
+                    shot = client.take_screenshot("login", "expired")
+                    notifier.send_photo(
+                        f"❌ Castle-Host 账号#{idx + 1}\n\nCookie已失效，请更新\n\n⏰ {now()}", shot)
                 return None, []
 
             for sid in server_ids:
-                masked = mask_id(sid)
-                logger.info(f"--- 处理服务器 {masked} ---")
-
-                pre, _ = await client.ensure_running(sid)
-
-                status, msg, screenshot, expiry, days = await client.renew(sid)
-
-                # 续约后复核：启动指令到面板状态刷新有延迟；若续约前因过期启动被拒，
-                # 此时可再试一次（allow_start 只在前一次没成功时打开，避免重复下指令）。
-                start, start_msg = await client.ensure_running(
-                    sid, allow_start=pre is not StartStatus.STARTED
-                )
+                logger.info(f"--- 处理服务器 {mask_id(sid)} ---")
+                pre, _ = client.ensure_running(sid)
+                status, msg, screenshot, expiry, days = client.renew(sid)
+                # 续约后复核：启动指令到面板刷新有延迟；若续约前因过期开不了机，续约后可再试
+                start, start_msg = client.ensure_running(
+                    sid, allow_start=pre is not StartStatus.STARTED)
                 if start is StartStatus.RUNNING and pre is StartStatus.STARTED:
                     start, start_msg = StartStatus.STARTED, ""
-
-                results.append(ServerResult(sid, status, msg, expiry, days, start, start_msg, screenshot))
+                results.append(
+                    ServerResult(sid, status, msg, expiry, days, start, start_msg, screenshot))
 
             for r in results:
                 if r.status == RenewalStatus.SUCCESS:
-                    # UC 旁路会把"已过验证码"写进 message，这件事需要在通知里被看到
                     status_icon, status_text = "✅", r.message or "续约成功"
                 elif r.status == RenewalStatus.RATE_LIMITED:
                     status_icon, status_text = "⏭️", "今日已续期"
@@ -890,22 +880,20 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier,
                 else:
                     status_icon, status_text = "❌", f"续约失败: {r.message}"
 
-                masked_id = mask_id(r.server_id)
                 caption = (
                     f"🖥️ Castle-Host 自动续约\n\n"
                     f"状态: {status_icon} {status_text}\n"
                     f"账号: #{idx + 1}\n\n"
-                    f"💻 服务器: {masked_id}\n"
+                    f"💻 服务器: {mask_id(r.server_id)}\n"
                     f"📅 到期: {convert_date(r.expiry)}\n"
                     f"⏳ 剩余: {r.days} 天\n"
                     f"{start_line(r.start, r.start_msg)}\n"
-                    f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"⏰ {now()}"
                 )
-                await notifier.send_photo(caption, r.screenshot)
+                notifier.send_photo(caption, r.screenshot)
 
-            new_cookie = join_cookies(client.uc_cookies) if client.uc_cookies \
-                else await client.extract_cookies()
-            # 与输入的规范化形式比较：只有值真的变了才回写，避免因为顺序或瞬态项反复改 secret
+            new_cookie = client.extract_cookies()
+            # 与输入的规范化形式比较：只有值真变了才回写，避免因顺序或瞬态项反复改 secret
             if new_cookie and new_cookie != join_cookies(pairs):
                 logger.info(f"🔄 账号#{idx + 1} Cookie已变化")
                 return new_cookie, results
@@ -913,19 +901,13 @@ async def process_account(cookie_str: str, idx: int, notifier: Notifier,
 
         except Exception as e:
             logger.error(f"❌ 账号#{idx + 1} 异常: {e}")
-            error_screenshot = await client.take_screenshot("error", "exception")
-            await notifier.send_photo(
-                f"❌ Castle-Host 账号#{idx + 1}\n\n异常: {e}\n\n"
-                f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                error_screenshot
-            )
+            shot = client.take_screenshot("error", "exception")
+            notifier.send_photo(
+                f"❌ Castle-Host 账号#{idx + 1}\n\n异常: {e}\n\n⏰ {now()}", shot)
             return None, []
-        finally:
-            await ctx.close()
-            await browser.close()
 
 
-async def main():
+def main():
     logger.info("=" * 50)
     logger.info("🖥️ Castle-Host 自动续约")
     logger.info("=" * 50)
@@ -945,7 +927,12 @@ async def main():
     new_cookies, changed = [], False
 
     for i, cookie in enumerate(config.cookies_list):
-        new, _ = await process_account(cookie, i, notifier, config.browser_proxy)
+        try:
+            new, _ = process_account(cookie, i, notifier, config.proxy)
+        except Exception as e:
+            # SB 上下文进入本身也可能抛（浏览器起不来等），别让一个账号带走整轮
+            logger.error(f"❌ 账号#{i + 1} 处理未捕获异常: {e}")
+            new = None
         if new:
             new_cookies.append(new)
             if new != cookie:
@@ -953,13 +940,23 @@ async def main():
         else:
             new_cookies.append(cookie)
         if i < len(config.cookies_list) - 1:
-            await asyncio.sleep(5)
+            time.sleep(5)
 
     if changed:
-        await github.update_secret("CASTLE_COOKIES", ",".join(new_cookies))
+        github.update_secret("CASTLE_COOKIES", ",".join(new_cookies))
 
     logger.info("👋 完成")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
+
+
+
+
+
+
+
+
+
+

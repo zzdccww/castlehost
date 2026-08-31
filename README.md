@@ -9,8 +9,8 @@
 - 多账号串行处理，每个账号独立浏览器实例
 - 服务器 ID 自动发现，不需要手填
 - 每天停机窗口过后自动开机，续约后再复核服务器是否真的起来了
-- 付款页弹 Turnstile 验证码时自动切到 UC 模式真实点击过验证，过不去才转人工
-- 续约结果附全页截图推送 Telegram
+- 全程用 SeleniumBase UC 模式（真实浏览器 + 真实鼠标），付款页弹 Turnstile 时自动点击过验证，过不去才转人工
+- 续约结果附截图推送 Telegram
 - Cookie 每次跑完自动回写 Secrets（可选）
 - 支持经 vless / vmess / trojan / ss 节点出网（可选）
 
@@ -61,7 +61,6 @@ Telegram 通知里的续约状态有五种：
 | 状态 | 含义 | 要不要处理 |
 |------|------|------------|
 | 续约成功 | 到期时间已延长 | 不用 |
-| 续约成功（已过验证码） | 付款页当时弹了 Turnstile，脚本自动过掉后续约成功 | 不用 |
 | 今日已续期 | 距上次续约不足 24 小时，站点拒绝 | 不用，第二天自动再试 |
 | 需人工过验证码 | 弹出 Cloudflare Turnstile 且自动过验证也没成 | 要，见下文常见问题 |
 | 续约失败 | 余额不足、CSRF 校验失败或其他站点报错 | 要，看通知里的原文 |
@@ -126,40 +125,35 @@ PAT 本身等同于账号凭据，只放进仓库 Secrets，不要写进代码�
 
 不配置 `PROXY_URL` 则整条链路自动跳过，直连出网。隧道起不来时 job 会立即失败，日志末尾打印 `singbox.log` 便于排查。
 
-### 强制走验证码旁路（调试用）
-
-付款页平时不开 Turnstile，所以自动过验证那条路径平时不会被触发，想验证它通不通只能强制走一次：仓库 → Settings → Secrets and variables → Actions → Variables → New repository variable，Name 填 `CASTLE_FORCE_SB_PAY`，Value 填 `1`，然后手动跑一次 workflow。
-
-它是 Variable 而不是 Secret，因为值本身不敏感、且需要能在日志里看清是否生效。验证完把它删掉或改成 `0`，否则每次运行都要多花一两分钟绕远路。
-
 ## 本地运行
 
-```bash
-pip install playwright aiohttp pynacl
-playwright install chromium
+**UC 模式靠移动真实鼠标点击，会抢走鼠标控制权，不能在自己正在用的桌面上跑。** 整段脚本（开机 + 续约）都是 UC，本地跑必须放进一个独立的虚拟显示里（如 Linux 的 `xvfb`），或一台你不操作的机器。日常验证交给 CI 即可，本地只验证纯函数（`classify_renew_error` / `parse_expiry` / `cookie_pairs` / `norm_proxy`）。
 
-CASTLE_COOKIES='PHPSESSID=xxx; uid=xxx' python renew.py
+依赖（与 workflow 一致）：
+
+```bash
+pip install seleniumbase requests pynacl
+seleniumbase install chromedriver
 ```
 
-PowerShell：
+Linux + xvfb 下跑一次：
 
-```powershell
-$env:CASTLE_COOKIES='PHPSESSID=xxx; uid=xxx'; python renew.py
+```bash
+CASTLE_COOKIES='PHPSESSID=xxx; uid=xxx' \
+  xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
 ```
 
 日志同时写到终端和 `castle_renew.log`，截图落在 `output/screenshots/`。
-
-付款页验证码那条旁路（`sb_pay.py`）另需 `pip install seleniumbase` 和 `seleniumbase install chromedriver`。**不要在自己正在用的桌面上跑它** —— 它靠移动真实鼠标指针点击验证码，会抢走鼠标控制权。这条路径交给 CI 的虚拟显示跑。
 
 ## 常见问题
 
 **提示需人工过验证码怎么办**
 
-站点在续约接口前加了 Cloudflare Turnstile。脚本会先自己试着过：切到 UC 模式（SeleniumBase）用真实鼠标点击，最多试 6 轮。GitHub Actions 的出口 IP 被 Cloudflare 重点标记，成功率不高，配了 `PROXY_URL` 会好一些。连这一步也没过才推这条通知 —— 用浏览器正常登录一次、手动过掉验证，会话解锁后自动运行即可恢复。
+站点在付款页/续约接口前加了 Cloudflare Turnstile。脚本本就跑在 UC 模式（SeleniumBase）里，会用真实鼠标点击自动过验证，最多试 6 轮。GitHub Actions 的出口 IP 被 Cloudflare 重点标记，成功率不高，配了 `PROXY_URL` 会好一些。连这一步也没过才推这条通知 —— 用浏览器正常登录一次、手动过掉验证，会话解锁后自动运行即可恢复。
 
 **通知里到期日期没变，但剩余天数增加了**
 
-两个数字取自付款页的不同字段，刷新有先后。以通知状态为准，它读的是接口返回值。
+两个数字取自付款页的不同字段，刷新有先后。脚本以"续约后重新载入付款页读到的到期日是否前移"作为成功的硬判据，通知里的日期就是这个复核值。
 
 **能不能改成一天跑多次**
 
@@ -169,8 +163,7 @@ $env:CASTLE_COOKIES='PHPSESSID=xxx; uid=xxx'; python renew.py
 
 | 文件 | 作用 |
 |------|------|
-| `renew.py` | 主续约逻辑 |
-| `sb_pay.py` | 付款页 Turnstile 旁路，UC 模式真实点击，由 `renew.py` 以子进程调用 |
+| `renew.py` | 全部逻辑：SeleniumBase UC 登录、开机、续约、通知、cookie 回写 |
 | `proxy_handler.py` | 把节点分享链接翻译成 sing-box 配置，仅 CI 用 |
 | `.github/workflows/renew.yml` | 定时调度、代理隧道与虚拟显示 |
 | `CLAUDE.md` | 给 AI 编码助手看的架构说明 |
