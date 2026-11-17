@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **整站单栈：只有 SeleniumBase UC，没有 Playwright、没有 asyncio、没有子进程。** 早期版本是"Playwright 无头主路径 + 付款页 Turnstile 时切 `sb_pay.py` UC 子进程旁路"的双栈；2026-08-31 合并为单栈（原因见下节「为什么整站只用 UC」）。程序是**同步**的、跑在主线程上。
 
-仓库包含三个代码/配置文件：`renew.py`（全部逻辑：登录、开机、续约、通知、cookie 回写）、`proxy_handler.py`（把节点分享链接翻译成 sing-box 配置，仅 CI 用）和 `.github/workflows/renew.yml`（调度 + 代理隧道 + 虚拟显示），另有面向使用者的 `README.md`。无测试、无 linter 配置、无依赖清单文件。
+主要代码/配置文件：`renew.py`（全部逻辑：登录、开机、续约、通知、cookie 回写）、`proxy_handler.py`（把节点分享链接翻译成 sing-box 配置，仅 CI 用）和 `.github/workflows/renew.yml`（调度 + 代理隧道 + 虚拟显示），另有面向使用者的 `README.md`。`tests/test_renew.py` 使用模拟浏览器验证 UC 重连及业务失败退出状态；无 linter 配置、无依赖清单文件。
 
 ## 常用命令
 
@@ -21,7 +21,11 @@ seleniumbase install chromedriver
 
 **不能在自己正在用的桌面上跑 `renew.py`。** UC 模式经 `uc_gui_click_captcha()` 移动真实鼠标指针点击，会抢走鼠标控制权；而且整段脚本（开机 + 续约）都是 UC，不是只有某条旁路。本地实跑必须放进独立虚拟显示（Linux 的 `xvfb`）或一台你不操作的机器；日常验证交给 CI。UC 不能与 headless 同用（SeleniumBase 官方明确 headless 下 UC 可被检测），所以没有 headless 开关。
 
-本地只验证纯函数，不需要显示器也不碰鼠标：
+本地验证纯函数和模拟浏览器测试，不需要显示器也不碰鼠标：
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ```bash
 python - <<'PY'
@@ -37,7 +41,7 @@ PY
 Linux + xvfb 下实跑一次：
 
 ```bash
-CASTLE_COOKIES='PHPSESSID=xxx; uid=xxx' \
+CASTLE_COOKIES='CH_SESSION=xxx; uid=xxx' \
   xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
 ```
 
@@ -61,6 +65,10 @@ PROXY_URL='vless://uuid@host:443?security=tls&type=ws&path=/ws' python proxy_han
 | `CHROME_PROXY` | 否 | 仅 `renew.py` 读取。浏览器代理地址，CI 里固定为 `http://127.0.0.1:8118`。`norm_proxy()` 剥掉 scheme 得到 `host:port` 交给 `SB(proxy=...)`；空值转 `None` 直连，不抛异常 |
 
 ## 架构要点
+
+**UC 导航连接检查。** 统一经 `open_uc_page()` 导航并读取 `driver.window_handles` 确认 ChromeDriver 已恢复连接。SeleniumBase UC 的 `reconnect()` 会吞掉部分服务启动异常，所以不能仅凭导航方法返回就继续轮询 DOM。连接失败时只重试导航一次，仍失败抛出 `BrowserConnectionError`；服务器发现阶段必须让它向上传递，避免误当成空列表。驱动失联时跳过截图，防止截图方法再次长时间等待。
+
+**Actions 退出状态。** `main()` 返回 0/1，由 `sys.exit(main())` 传给 workflow。缺配置、账号异常、无结果、续约失败或服务器未确认运行均记为失败；正常的 24 小时续约限制不算失败。失败账号保留原 Cookie，其他账号继续执行，最后统一退出。
 
 **判定靠 DOM + 状态复核，不是响应体拦截（本次重构最大的改变）。** 旧的 Playwright 版本靠 `page.on("response")` 抓 `buy_months` / `start` 接口的 JSON 判成败，那是当时"最关键的设计"。SeleniumBase/UC **没有等价的响应体拦截**：UC 导航时会断开 webdriver，也不走 CDP Network，读不到 XHR 响应体。因此判定改为：
 

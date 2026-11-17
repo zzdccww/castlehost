@@ -20,7 +20,7 @@ UC 模式（uc_gui_click_captcha 点击瞬间断开 webdriver、由操作系统�
   **本地不能在自己桌面上跑 —— 会抢走鼠标控制权。**
 - 单账号更慢：UC + uc_open_with_reconnect 比 headless Playwright 慢，每账号约 60-90 秒起。
 
-配置变量：CASTLE_COOKIES=PHPSESSID=xxx; uid=xxx,PHPSESSID=xxx; uid=xxx（多账号逗号分隔，账号内分号分隔）。
+配置变量：CASTLE_COOKIES=CH_SESSION=xxx; uid=xxx,CH_SESSION=xxx; uid=xxx（多账号逗号分隔，账号内分号分隔）。
 """
 
 import os
@@ -435,6 +435,39 @@ class GitHubManager:
         return False
 
 
+class BrowserConnectionError(RuntimeError):
+    """UC 导航后 ChromeDriver 没有恢复可用连接。"""
+
+
+def open_uc_page(sb, url: str, reconnect_time: int):
+    """UC 重连会吞掉底层启动异常；检查连接，只重试只读导航一次。"""
+    for attempt in range(2):
+        try:
+            sb.uc_open_with_reconnect(url, reconnect_time)
+            if not sb.driver.window_handles:
+                raise RuntimeError("浏览器没有可用窗口")
+            return
+        except Exception as e:
+            try:
+                service = sb.driver.service
+                process = service.process
+                exit_code = process.poll() if process is not None else "无进程"
+                logger.warning(
+                    f"⚠️ ChromeDriver 状态: 退出码={exit_code} 端口可连接={service.is_connectable()}"
+                )
+            except Exception:
+                pass
+            if attempt:
+                raise BrowserConnectionError(f"UC 导航后 ChromeDriver 连接未恢复: {e}") from e
+            logger.warning(f"⚠️ UC 导航连接失败，尝试重连一次: {e}")
+            try:
+                sb.driver.reconnect(0.5)
+            except Exception as reconnect_error:
+                raise BrowserConnectionError(
+                    f"ChromeDriver 重连失败: {reconnect_error}"
+                ) from reconnect_error
+
+
 class CastleClient:
     """一个账号的一个 UC 会话。开机与续约都在这里，判定靠 DOM + 状态复核（无响应体可读）。"""
 
@@ -447,6 +480,8 @@ class CastleClient:
         """save_screenshot 走 basename + folder，避免把绝对路径当文件名。UC 只截可视区，
         与旧 Playwright full_page 不同，但足够看清 toast/状态。"""
         try:
+            if not self.sb.driver.window_handles:
+                return ""
             path = screenshot_path(self.account_idx, server_id, stage)
             folder = os.path.dirname(path) or None
             self.sb.save_screenshot(os.path.basename(path), folder=folder)
@@ -512,7 +547,7 @@ class CastleClient:
 
     def goto_servers(self):
         """打开 /servers 并等就绪信号（ServersID 已定义），再过 CSRF、点掉 cookie 横幅。"""
-        self.sb.uc_open_with_reconnect(f"{BASE}/servers", RECONNECT)
+        open_uc_page(self.sb, f"{BASE}/servers", RECONNECT)
         for _ in range(30):
             try:
                 if self.sb.execute_script("return Array.isArray(window.ServersID)"):
@@ -544,6 +579,8 @@ class CastleClient:
                 logger.info(f"📋 找到 {len(ids)} 个服务器: {[mask_id(x) for x in ids]}")
                 return ids
             logger.error("❌ 未能从 /servers 提取服务器 ID")
+        except BrowserConnectionError:
+            raise
         except Exception as e:
             logger.error(f"❌ 获取服务器ID失败: {e}")
         return []
@@ -696,8 +733,10 @@ class CastleClient:
     def _reload_expiry(self, pay_url: str) -> Tuple[str, int]:
         """重载付款页读回到期日。UC 无响应体，续约成败的硬判据就是这个日期有没有前移。"""
         try:
-            self.sb.uc_open_with_reconnect(pay_url, RELOAD_RECONNECT)
+            open_uc_page(self.sb, pay_url, RELOAD_RECONNECT)
             return parse_expiry(self._body_text())
+        except BrowserConnectionError:
+            raise
         except Exception as e:
             logger.warning(f"复核付款页失败: {e}")
             return "", 0
@@ -710,7 +749,7 @@ class CastleClient:
         pay_url = f"{BASE}/servers/pay/index/{sid}"
         try:
             logger.info("📄 访问续约页面...")
-            self.sb.uc_open_with_reconnect(pay_url, RECONNECT)
+            open_uc_page(self.sb, pay_url, RECONNECT)
             for _ in range(30):
                 try:
                     if self.sb.execute_script("return typeof window.freePay === 'function'"):
@@ -790,7 +829,8 @@ class CastleClient:
 
         except Exception as e:
             logger.error(f"❌ 续约服务器 {masked} 异常: {e}")
-            screenshot_file = self.take_screenshot(sid, "exception")
+            if not isinstance(e, BrowserConnectionError):
+                screenshot_file = self.take_screenshot(sid, "exception")
             return RenewalStatus.FAILED, str(e), screenshot_file, expiry, days
 
     def extract_cookies(self) -> Optional[str]:
@@ -839,7 +879,7 @@ def process_account(cookie_str: str, idx: int, notifier: Notifier,
             logger.warning(f"最大化窗口失败: {e}")
 
         # 先落到域名下才能注 cookie（Selenium 不允许给当前域之外的域设 cookie）
-        sb.uc_open_with_reconnect(f"{BASE}/servers", RECONNECT)
+        open_uc_page(sb, f"{BASE}/servers", RECONNECT)
         sb.add_cookies(
             [{"name": n, "value": v, "domain": ".castle-host.com", "path": "/"}
              for n, v in pairs.items()],
@@ -901,13 +941,16 @@ def process_account(cookie_str: str, idx: int, notifier: Notifier,
 
         except Exception as e:
             logger.error(f"❌ 账号#{idx + 1} 异常: {e}")
-            shot = client.take_screenshot("error", "exception")
+            shot = (
+                "" if isinstance(e, BrowserConnectionError)
+                else client.take_screenshot("error", "exception")
+            )
             notifier.send_photo(
                 f"❌ Castle-Host 账号#{idx + 1}\n\n异常: {e}\n\n⏰ {now()}", shot)
             return None, []
 
 
-def main():
+def main() -> int:
     logger.info("=" * 50)
     logger.info("🖥️ Castle-Host 自动续约")
     logger.info("=" * 50)
@@ -917,7 +960,7 @@ def main():
 
     if not config.cookies_list:
         logger.error("❌ 未设置 CASTLE_COOKIES")
-        return
+        return 1
 
     logger.info(f"📊 共 {len(config.cookies_list)} 个账号")
 
@@ -925,14 +968,21 @@ def main():
     github = GitHubManager(config.repo_token, config.repository)
 
     new_cookies, changed = [], False
+    failed_accounts = 0
 
     for i, cookie in enumerate(config.cookies_list):
         try:
-            new, _ = process_account(cookie, i, notifier, config.proxy)
+            new, results = process_account(cookie, i, notifier, config.proxy)
         except Exception as e:
             # SB 上下文进入本身也可能抛（浏览器起不来等），别让一个账号带走整轮
             logger.error(f"❌ 账号#{i + 1} 处理未捕获异常: {e}")
-            new = None
+            new, results = None, []
+        if not new or not results or any(
+            r.status not in (RenewalStatus.SUCCESS, RenewalStatus.RATE_LIMITED)
+            or r.start not in (StartStatus.RUNNING, StartStatus.STARTED)
+            for r in results
+        ):
+            failed_accounts += 1
         if new:
             new_cookies.append(new)
             if new != cookie:
@@ -945,11 +995,15 @@ def main():
     if changed:
         github.update_secret("CASTLE_COOKIES", ",".join(new_cookies))
 
+    if failed_accounts:
+        logger.error(f"❌ 完成：{failed_accounts}/{len(config.cookies_list)} 个账号未完成开机或续约")
+        return 1
     logger.info("👋 完成")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
 
 
 

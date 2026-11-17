@@ -22,16 +22,18 @@ Fork 之后在自己的仓库里操作，Actions 需要手动启用一次。
 
 ### 2. 取 Cookie
 
-浏览器登录 `cp.castle-host.com`，打开开发者工具 → Application → Cookies，复制 `PHPSESSID` 和 `uid` 两项，拼成一行：
+浏览器登录 `cp.castle-host.com`，打开开发者工具 → Application → Cookies → `https://cp.castle-host.com`，复制 `CH_SESSION` 和 `uid` 两项的当前值，拼成一行：
 
 ```
-PHPSESSID=abc123...; uid=456...
+CH_SESSION=abc123...; uid=456...
 ```
+
+站点当前的会话 Cookie 名称是 `CH_SESSION`，没有 `PHPSESSID` 属正常情况。脚本已支持 `CH_SESSION`；`PHPSESSID` 仅用于兼容旧会话。必须复制浏览器中 `CH_SESSION` 的实际值，不能把旧 `PHPSESSID` 的值改个键名继续使用。已有配置需要在仓库 Settings → Secrets and variables → Actions 中更新 `CASTLE_COOKIES`，然后重新运行 workflow。
 
 多个账号之间用英文逗号分隔，账号内部用分号分隔，这两级分隔符不能混用：
 
 ```
-PHPSESSID=账号1的值; uid=账号1的值,PHPSESSID=账号2的值; uid=账号2的值
+CH_SESSION=账号1的值; uid=账号1的值,CH_SESSION=账号2的值; uid=账号2的值
 ```
 
 Cookie 等同于账号凭据，只能放进仓库 Secrets，不要写进代码或提交到仓库。
@@ -80,6 +82,8 @@ Telegram 通知里的续约状态有五种：
 
 Cookie 失效时不推续约结果，而是单独推一条"Cookie 已失效"并附登录页截图。
 
+Actions 的结果也会反映业务是否完成：缺少 Cookie、浏览器连接失败、没有发现服务器、续约失败或运行状态未确认时，脚本以退出码 1 结束；续约成功或今日已续期，且服务器已启动或正在运行时，退出码为 0。单个账号失败仍会继续处理其他账号，并保留失败账号原来的 Cookie。
+
 ## 可选项
 
 ### Cookie 自动轮换
@@ -127,7 +131,13 @@ PAT 本身等同于账号凭据，只放进仓库 Secrets，不要写进代码�
 
 ## 本地运行
 
-**UC 模式靠移动真实鼠标点击，会抢走鼠标控制权，不能在自己正在用的桌面上跑。** 整段脚本（开机 + 续约）都是 UC，本地跑必须放进一个独立的虚拟显示里（如 Linux 的 `xvfb`），或一台你不操作的机器。日常验证交给 CI 即可，本地只验证纯函数（`classify_renew_error` / `parse_expiry` / `cookie_pairs` / `norm_proxy`）。
+**UC 模式靠移动真实鼠标点击，会抢走鼠标控制权，不能在自己正在用的桌面上跑。** 整段脚本（开机 + 续约）都是 UC，本地跑必须放进一个独立的虚拟显示里（如 Linux 的 `xvfb`），或一台你不操作的机器。日常实跑验证交给 CI；本地验证纯函数及使用模拟浏览器的单元测试。
+
+单元测试不启动浏览器、不调用站点或通知接口：
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 依赖（与 workflow 一致）：
 
@@ -139,13 +149,17 @@ seleniumbase install chromedriver
 Linux + xvfb 下跑一次：
 
 ```bash
-CASTLE_COOKIES='PHPSESSID=xxx; uid=xxx' \
+CASTLE_COOKIES='CH_SESSION=xxx; uid=xxx' \
   xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
 ```
 
 日志同时写到终端和 `castle_renew.log`，截图落在 `output/screenshots/`。
 
 ## 常见问题
+
+**更换为 `CH_SESSION` 后仍出现 `Connection refused`**
+
+先看错误中的地址。`HTTPConnectionPool(host='localhost', ...)` 和 `/session/.../window/handles` 指的是 runner 上的 ChromeDriver 连接，不是 Castle-Host 接口。UC 导航会停止并重新启动 ChromeDriver；脚本现在会检查连接、在失败时重连并重试导航一次，仍失败则报告浏览器连接错误并让 Actions 失败。日志中的 `ChromeDriver 状态` 会提供驱动进程退出码和端口连通性，便于继续定位。仅凭 Cookie 已注入的日志不能证明登录成功，需要后续成功读取服务器列表。
 
 **提示需人工过验证码怎么办**
 
