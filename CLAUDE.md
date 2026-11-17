@@ -68,6 +68,8 @@ PROXY_URL='vless://uuid@host:443?security=tls&type=ws&path=/ws' python proxy_han
 
 **UC 导航连接检查。** 统一经 `open_uc_page()` 导航并读取 `driver.window_handles` 确认 ChromeDriver 已恢复连接。SeleniumBase UC 的 `reconnect()` 会吞掉部分服务启动异常，所以不能仅凭导航方法返回就继续轮询 DOM。连接失败时只重试导航一次，仍失败抛出 `BrowserConnectionError`；服务器发现阶段必须让它向上传递，避免误当成空列表。驱动失联时跳过截图，防止截图方法再次长时间等待。
 
+**必须保留 `chromium_arg="--disable-popup-blocking"`。** SeleniumBase UC 导航依赖 `window.open()` 创建新标签，然后关闭旧标签。Linux Chrome 在第二次导航时可能阻止弹窗；UC 仍关闭旧标签，会丢失唯一浏览器窗口，随后报 ChromeDriver 连接拒绝。隔离 Linux 测试已复现第二次打开返回空值，加入该参数后直连和本机代理均连续导航成功。复现脚本为 `.codex/uc_repro.py`，必须在虚拟显示中运行，仅使用本机测试页面和虚拟 Cookie。
+
 **Actions 退出状态。** `main()` 返回 0/1，由 `sys.exit(main())` 传给 workflow。缺配置、账号异常、无结果、续约失败或服务器未确认运行均记为失败；正常的 24 小时续约限制不算失败。失败账号保留原 Cookie，其他账号继续执行，最后统一退出。
 
 **判定靠 DOM + 状态复核，不是响应体拦截（本次重构最大的改变）。** 旧的 Playwright 版本靠 `page.on("response")` 抓 `buy_months` / `start` 接口的 JSON 判成败，那是当时"最关键的设计"。SeleniumBase/UC **没有等价的响应体拦截**：UC 导航时会断开 webdriver，也不走 CDP Network，读不到 XHR 响应体。因此判定改为：

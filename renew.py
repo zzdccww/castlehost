@@ -865,7 +865,8 @@ def process_account(cookie_str: str, idx: int, notifier: Notifier,
     logger.info(f"📌 处理账号 #{idx + 1}")
     now = lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    kwargs = {"uc": True, "headless": False}   # UC 在 headless 下可被检测，显示由 xvfb 提供
+    # UC 用 window.open 新建标签后关闭旧标签；弹窗被拦截会关闭唯一窗口，令后续重连失败。
+    kwargs = {"uc": True, "headless": False, "chromium_arg": "--disable-popup-blocking"}
     if proxy:
         kwargs["proxy"] = proxy
         logger.info("🌐 浏览器经代理出网")   # 不打印地址：仓库公开，Actions 日志同样公开

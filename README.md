@@ -159,7 +159,7 @@ CASTLE_COOKIES='CH_SESSION=xxx; uid=xxx' \
 
 **更换为 `CH_SESSION` 后仍出现 `Connection refused`**
 
-先看错误中的地址。`HTTPConnectionPool(host='localhost', ...)` 和 `/session/.../window/handles` 指的是 runner 上的 ChromeDriver 连接，不是 Castle-Host 接口。UC 导航会停止并重新启动 ChromeDriver；脚本现在会检查连接、在失败时重连并重试导航一次，仍失败则报告浏览器连接错误并让 Actions 失败。日志中的 `ChromeDriver 状态` 会提供驱动进程退出码和端口连通性，便于继续定位。仅凭 Cookie 已注入的日志不能证明登录成功，需要后续成功读取服务器列表。
+先看错误中的地址。`HTTPConnectionPool(host='localhost', ...)` 和 `/session/.../window/handles` 指的是 runner 上的 ChromeDriver 连接。已在隔离 Linux 环境复现一种原因：UC 导航先用 `window.open()` 打开新标签，再关闭旧标签；第二次打开被弹窗拦截器阻止时，浏览器会失去唯一窗口，后续重连也无法恢复。脚本已加入 `--disable-popup-blocking` 启动参数，允许 UC 创建新标签，并检查导航后的驱动连接；仍失败时会记录 `ChromeDriver 状态` 并让 Actions 失败。仅凭 Cookie 已注入的日志不能证明登录成功，需要后续成功读取服务器列表。
 
 **提示需人工过验证码怎么办**
 
