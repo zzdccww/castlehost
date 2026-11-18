@@ -72,28 +72,28 @@ PROXY_URL='vless://uuid@host:443?security=tls&type=ws&path=/ws' python proxy_han
 
 **Actions 退出状态。** `main()` 返回 0/1，由 `sys.exit(main())` 传给 workflow。缺配置、账号异常、无结果、续约失败或服务器未确认运行均记为失败；正常的 24 小时续约限制不算失败。失败账号保留原 Cookie，其他账号继续执行，最后统一退出。
 
-**判定靠 DOM + 状态复核，不是响应体拦截（本次重构最大的改变）。** 旧的 Playwright 版本靠 `page.on("response")` 抓 `buy_months` / `start` 接口的 JSON 判成败，那是当时"最关键的设计"。SeleniumBase/UC **没有等价的响应体拦截**：UC 导航时会断开 webdriver，也不走 CDP Network，读不到 XHR 响应体。因此判定改为：
+**接口结果与状态复核。** UC 导航时断开 webdriver，但页面 jQuery 的 `ajaxComplete` 仍能保存动作响应。开机动作前安装 `_OBSERVE_START_JS`，导航前读取白名单字段；不启用 CDP Network、不记录原始响应或凭据。
 
 - **续约**：点 `#freebtn` 后重新载入付款页，比对到期日是否前移（`expiry_advanced()`，**硬判据**）；辅以 iziToast 文本（`успешно` 大小写不敏感）。两者任一成立即判成功，避免单看 toast 误判。
-- **开机**：`ensure_running()` 下达启动指令后 `time.sleep(5)`，重载 `/servers`，复核 `check_server_stopped()` 是否由 `True` 翻成 `False`（**硬判据**）。翻转成功即 `STARTED`，仍关机则读 toast 归类（被判定会话的 start POST 会回 `Ошибка валидации запроса!`，toast 里能看到）。
+- **开机**：`ensure_running()` 导航前最多等待 20 秒读取接口结果。`status=error` 保留脱敏的原文，验证码响应单独分类。明确接受后最多四次间隔 5 秒重载 `/servers` 复核；仅该服务器明确的运行控制按钮才确认 `STARTED`，按钮缺失为 `UNKNOWN`。HTTP 200 或 `status=success` 单独不能判成功。
 - **验证码闸门**：`captcha_gate_active()` 看 `#validateModal.show` 是否存在。
 
-这套判据比响应拦截脆，缓解办法就是"硬判据"（到期日前移 / 状态翻转）为主、toast 为辅。改这两处时不要退回只看 toast。
+保持到期日前移 / 明确运行状态的复核；不要退回只看 toast 或 HTTP 状态。
 
 **服务器 ID 动态发现。** `get_server_ids()` 用正则从 `/servers` 页面 HTML（`sb.get_page_source()`）提取 `var ServersID = [...]`，不硬编码 ID；取不到再依次回退 `window.ServersID`（`execute_script`）和页面链接里的数字 ID。workflow 因此不需要任何 `SERVER_ID` 配置。
 
-**开机是与续约并列的目的，不是附带动作。** 站点每天莫斯科时间 0-1 点强制停掉免费服务器，所以 workflow 定在 `cron: '10 22 * * *'`（UTC）= 莫斯科时间 01:10 = 北京时间 06:10，压在停机窗口结束后 10 分钟。GitHub 排队延迟只会让开机稍晚，不会把运行时刻推回停机窗口内。改时间前先换算 UTC，Actions 的 cron 只认 UTC。
+**开机是与续约并列的目的。** 保留用户的 `cron: '30 20 * * *'`（UTC）= 莫斯科时间 23:30 = 次日北京时间 04:30。用户接受此提前触发时间，因为 Actions 经常延迟两小时以上；排队延迟没有保证。未经新的需求不要改时间或加 schedule。
 
-`process_account()` 的每台服务器循环里 `ensure_running()` 调用两次：续约前负责拉起，续约后负责复核（`allow_start=pre is not StartStatus.STARTED`，前一次已成功下指令就不再重复下）。第二次调用同时覆盖两种情况 —— 启动指令到面板状态刷新的延迟，以及"续约前因过期开不了机、续约后才能开"。返回值折叠成一个 `StartStatus` 存进 `ServerResult.start`，由 `start_line()` 渲染成通知里的一行：启动失败必须可见，不能只显示"续约成功"让人误以为服务器活着。
+`process_account()` 的每台服务器循环里 `ensure_running()` 调用两次：续约前拉起，续约后复核。前次为 `STARTED`、`STOPPED` 或 `UNKNOWN` 时不重复下指令；明确拒绝后允许续约解除过期/验证限制再尝试。前次请求待确认、续约后确认为运行时仍记录为本次 `STARTED`。最终状态存进 `ServerResult.start`，启动失败及未确认的具体原因必须在通知中可见。
 
-**直接调用页面内 JS 函数。** 开机走 `sb.execute_script(f"return {fn}({sid}, 'start')")`（`fn` 是 `sendAction` 或 `sendActionStatus`），而不是点按钮或自行构造 HTTP 请求 —— 这样能复用站点自身的 CSRF token 逻辑；页面没导出函数时才回退到点 `[onclick*="{sid}"][onclick*="start"]`。关机状态由 `check_server_stopped()` 用 `execute_script` 扫描所有 `[onclick]` 属性里是否存在 `(sid,'start'` 判断，不依赖图标 class。该方法返回 `Optional[bool]`，**判定失败返回 `None` 而非 `False`** —— 把未知当成"在运行"会让每日强停后静默跳过启动，这是设计上刻意区分的。续约点击的是 `#freebtn`。
+**直接调用页面内 JS 函数。** 开机走页面自身的 `sendAction` / `sendActionStatus` 复用 CSRF token 注入，函数缺失才回退点击按钮。`check_server_stopped()` 只检查该服务器的 `[onclick]`：`start` 为停止，`stop/restart/kill` 为运行，没有相关按钮返回 `None`。续约点击 `#freebtn`。
 
 **错误分类匹配俄语字符串。** `classify_renew_error()` 对文本的判断依赖俄语子串，不要改成英文：
 - `"24 час"` / `"продлен"` → 24 小时限流（`RATE_LIMITED`，属正常结果非失败）
 - `"недостаточно"` → 余额不足
 - `"валидации"` → CSRF 校验失败
 
-这份规则是模块级函数，因为续约的 toast 和开机的 toast 都喂它（都是页面 iziToast 原文）。新增分类只改这一处。
+续约使用 `classify_renew_error()`；开机使用 `classify_start_error()` 保留接口原文，通用启动故障不能误报成 Cookie/CSRF 失效。
 
 **CSRF token 的注入链，动作前必须等它就绪。** 状态变更请求（开机、续约）都由页面内 JS 发出，依赖站点自己的 CSRF 头注入。站点机制已实测确认：
 

@@ -13,9 +13,9 @@ UC 模式（uc_gui_click_captcha 点击瞬间断开 webdriver、由操作系统�
 其会话也更少被判定。于是开机与续约都放进同一个 UC 会话，消灭原来"Playwright 主路径 + UC 旁路"
 双栈及其子进程粘合代码。
 
-代价（相对旧版）：
-- 判定基准从"响应体拦截"退为"DOM/状态复核"：UC 导航时断开 webdriver，读不到 XHR 响应体。
-  续约以"到期日前移"为硬判据、toast 文本为辅；开机以 check_server_stopped 状态翻转为硬判据。
+判定与运行约束：
+- 开机通过页面 jQuery ajaxComplete 保存接口结果，导航前读取；仍以面板明确显示运行为成功判据。
+  续约以"到期日前移"为硬判据、toast 文本为辅。
 - 全程需要显示器：UC 靠真实鼠标，不能 headless。CI 用 xvfb-run 包住整段脚本。
   **本地不能在自己桌面上跑 —— 会抢走鼠标控制权。**
 - 单账号更慢：UC + uc_open_with_reconnect 比 headless Playwright 慢，每账号约 60-90 秒起。
@@ -47,6 +47,8 @@ RECONNECT = 6      # uc_open_with_reconnect 断连时长，越长越不易被识
 RELOAD_RECONNECT = 3   # 复核性重载（读到期日/状态）用更短的断连，省时间
 SOLVE_ROUNDS = 6   # 付款页 Turnstile 每轮点一次
 POLL_SECONDS = 8   # 点击/操作后等结果的秒数
+START_RESPONSE_SECONDS = 20  # 导航前等启动 AJAX 完成
+START_CONFIRM_ROUNDS = 4     # 接口接受后只复核状态，不重复发送启动请求
 # uc_gui_click_captcha 默认 frame="iframe" 只认第一个 iframe，而 #validateModal 里常驻另一个
 # Turnstile 容器 #cf-turnstile-validate。必须显式指定付款控件所在容器。
 PAY_FRAME = "#cf-turnstile-pay"
@@ -86,7 +88,7 @@ class StartStatus(Enum):
     启动失败必须能在通知里看到，不能被"续约成功"掩盖。"""
     RUNNING = "running"    # 本来就在运行，无需启动
     STARTED = "started"    # 本次下达启动指令并已确认运行
-    STOPPED = "stopped"    # 启动指令已发出，面板仍显示关机
+    STOPPED = "stopped"    # 面板仍显示关机，启动请求可能已接受或结果不明
     FAILED = "failed"      # 启动指令被站点拒绝或无响应
     CAPTCHA = "captcha"    # 被 Turnstile 闸门拦截
     UNKNOWN = "unknown"    # 运行状态判定失败
@@ -160,7 +162,7 @@ def start_line(status: StartStatus, msg: str) -> str:
     if status is StartStatus.RUNNING:
         return "🟢 服务器运行中\n"
     if status is StartStatus.STOPPED:
-        return "🟡 启动指令已发出，面板仍显示关机\n"
+        return f"🟡 {msg or '启动指令已发出，面板仍显示关机'}\n"
     if status is StartStatus.CAPTCHA:
         return f"🤖 启动被验证码拦截: {msg}\n"
     if status is StartStatus.UNKNOWN:
@@ -204,8 +206,7 @@ def expiry_advanced(old: str, new: str) -> bool:
 
 
 def classify_renew_error(error_msg: str) -> Tuple[RenewalStatus, str]:
-    """把站点返回的俄语报错/ toast 归类。续约与开机两处都喂它页面 toast 原文，
-    规则集中一处，改一处不漏。判断依赖俄语子串，不要改成英文：站点只发俄语。"""
+    """把续约的俄语报错/ toast 归类。判断依赖俄语子串：站点只发俄语。"""
     m = (error_msg or "").lower()
     if not m:
         return RenewalStatus.FAILED, "未知错误"
@@ -217,6 +218,17 @@ def classify_renew_error(error_msg: str) -> Tuple[RenewalStatus, str]:
     if "валидации" in m:
         return RenewalStatus.FAILED, "CSRF验证失败"
     return RenewalStatus.FAILED, error_msg
+
+
+def classify_start_error(message: str) -> str:
+    """保留启动接口原文，避免将站点内部启动故障误报成 Cookie/CSRF 问题。"""
+    message = message or "启动接口拒绝请求，但未提供错误原因"
+    lower = message.lower()
+    if "ошибка при запуске сервера" in lower:
+        return f"站点启动接口报错，请稍后重试（原文：{message}）"
+    if "валидации" in lower:
+        return f"请求验证失败（原文：{message}）"
+    return message
 
 
 def cookie_pairs(s: str) -> Dict[str, str]:
@@ -263,6 +275,48 @@ _SOLVED_JS = """
     var i = document.querySelector('input[name="cf-turnstile-response"]');
     return !!(i && i.value && i.value.length > 20);
 })()
+"""
+
+# UC 仅在导航时断开驱动；动作前安装页面监听，动作后读取，不依赖 CDP。
+# 只保存白名单字段，绝不记录原始响应、Cookie、CSRF token 或服务器地址。
+_OBSERVE_START_JS = """
+var sid = arguments[0], action = arguments[1];
+if (!window.jQuery) return false;
+var endpoint = '/servers/control/action/' + sid + '/' + action;
+var csrf = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+function safe(value) {
+    if (typeof value !== 'string') return '';
+    var current = (document.querySelector('meta[name="csrf-token"]') || {}).content || '';
+    var text = value;
+    [csrf, current].filter(Boolean).forEach(function(token) {
+        text = text.split(token).join('[csrf]');
+    });
+    text = text.split(sid).join('[server]');
+    var element = document.createElement('div');
+    element.innerHTML = text;
+    return (element.textContent || '').replace(/\\b\\d{1,3}(?:\\.\\d{1,3}){3}\\b/g, '[address]')
+        .replace(/[\\r\\n]+/g, ' ').slice(0, 600);
+}
+window.__castleStartResponse = null;
+jQuery(document).off('ajaxComplete.castleStart').on('ajaxComplete.castleStart', function(event, xhr, settings) {
+    var pathname;
+    try { pathname = new URL(settings.url, location.href).pathname.replace(/\\/$/, ''); }
+    catch (e) { return; }
+    if (pathname !== endpoint) return;
+    var data = xhr.responseJSON;
+    if (!data) { try { data = JSON.parse(xhr.responseText); } catch (e) {} }
+    var json = !!(data && typeof data === 'object' && !Array.isArray(data));
+    window.__castleStartResponse = {
+        http_status: xhr.status,
+        status: json ? safe(data.status) : '',
+        message: json ? safe(data.error || data.message || data.success) : '',
+        captcha_required: json && (data.status === 'captcha_required' || data.captcha_required === true),
+        json: json,
+        challenge: !json && /ddos.guard|turnstile|captcha/i.test(xhr.responseText || '')
+    };
+    jQuery(document).off('ajaxComplete.castleStart');
+});
+return true;
 """
 
 # 控件常被父容器 overflow:hidden 裁掉；逐层放开并把 cloudflare iframe 撑回可见尺寸。
@@ -469,7 +523,7 @@ def open_uc_page(sb, url: str, reconnect_time: int):
 
 
 class CastleClient:
-    """一个账号的一个 UC 会话。开机与续约都在这里，判定靠 DOM + 状态复核（无响应体可读）。"""
+    """一个账号的一个 UC 会话。开机读取接口结果，开机与续约均复核面板状态。"""
 
     def __init__(self, sb, account_idx: int):
         self.sb = sb
@@ -586,15 +640,21 @@ class CastleClient:
         return []
 
     def check_server_stopped(self, sid: str) -> Optional[bool]:
-        """关机时控制区渲染 start 按钮。只按 onclick 是否含 (sid,'start' 判断，不依赖图标 class。
+        """按该服务器明确的 start / stop 等控制按钮判定，不依赖图标 class。
         判定失败返回 None，不能当成"在运行"——那样每日强停后会静默跳过启动。"""
         try:
             return self.sb.execute_script(
                 """var sid = arguments[0];
-                return [...document.querySelectorAll('[onclick]')].some(function(e){
+                var actions = [...document.querySelectorAll('[onclick]')].map(function(e){
                     var s = (e.getAttribute('onclick') || '').replace(/\\s+/g, '');
-                    return s.includes('(' + sid + ",'start'") || s.includes('(' + sid + ',"start"');
-                });""",
+                    return ['start', 'stop', 'restart', 'kill'].find(function(action) {
+                        return s.includes('(' + sid + ",'" + action + "'")
+                            || s.includes('(' + sid + ',"' + action + '"');
+                    });
+                });
+                if (actions.includes('start')) return true;
+                if (actions.some(function(action) { return !!action; })) return false;
+                return null;""",
                 sid,
             )
         except Exception as e:
@@ -616,11 +676,26 @@ class CastleClient:
         self.sb.execute_script(f"return {fn}({sid}, '{action}')")
         return True
 
+    def _observe_start(self, sid: str) -> bool:
+        return bool(self.sb.execute_script(_OBSERVE_START_JS, sid, "start"))
+
+    def _wait_start_response(self) -> Optional[dict]:
+        for _ in range(START_RESPONSE_SECONDS * 2):
+            response = self.sb.execute_script("return window.__castleStartResponse || null")
+            if isinstance(response, dict):
+                logger.info("📨 启动接口: HTTP=%s status=%s message=%s",
+                            response.get("http_status"), response.get("status") or "(非JSON/未知)",
+                            response.get("message") or "(空)")
+                return response
+            time.sleep(0.5)
+        logger.warning("⚠️ 启动请求在 %s 秒内未收到响应，接下来只复核状态", START_RESPONSE_SECONDS)
+        return None
+
     def ensure_running(self, sid: str, allow_start: bool = True) -> Tuple[StartStatus, str]:
-        """确认服务器在运行，必要时调用页面 JS 启动。无响应体可读，判定靠状态翻转：
-        下指令 → 等 → 重载 /servers → 复核 check_server_stopped 是否由 true 翻 false。
+        """确认服务器在运行，必要时调用页面 JS 启动。导航前读取 AJAX 结果，随后复核状态。
         续约前后各调一次；allow_start=False 用于复核，避免重复下指令。"""
         masked = mask_id(sid)
+        dispatched = False
         try:
             url = self.sb.get_current_url() or ""
             if "/servers" not in url or "/control" in url or "/pay" in url:
@@ -633,43 +708,56 @@ class CastleClient:
                 logger.info(f"✅ 服务器 {masked} 运行中")
                 return StartStatus.RUNNING, ""
             if not allow_start:
-                logger.warning(f"🟡 服务器 {masked} 启动指令已发出，面板仍显示关机")
-                return StartStatus.STOPPED, "启动指令已发出，面板仍显示关机"
+                logger.warning(f"🟡 服务器 {masked} 仍显示关机，本次只复核状态")
+                return StartStatus.STOPPED, "面板仍显示关机，本次只复核状态"
 
             logger.info(f"🔴 服务器 {masked} 已关机，正在启动...")
             if not self.wait_csrf_ready():
                 return StartStatus.FAILED, "会话未携带 CSRF token（Cookie 可能已失效）"
+            if not self._observe_start(sid):
+                return StartStatus.FAILED, "无法安装启动响应监听，未发送请求"
             logger.info("🔄 发送启动指令...")
+            dispatched = True
             if not self._dispatch_action(sid, "start"):
                 logger.warning("⚠️ 页面未导出 sendAction/sendActionStatus，回退为点击按钮")
                 try:
-                    self.sb.click(f'[onclick*="{sid}"][onclick*="start"]')
+                    self.sb.click(f"""[onclick*="({sid},"][onclick*="'start'"], [onclick*="({sid},"][onclick*='"start"']""")
                 except Exception as e:
                     logger.warning(f"回退点击失败: {e}")
-            time.sleep(5)
-
-            # 重载前先读 toast：被判定会话的 start POST 会回 Ошибка валидации запроса!，
-            # 导航走了 toast 就没了。
+                    return StartStatus.STOPPED, "启动请求是否发出未确认，未重复尝试"
+            response = self._wait_start_response()
             tmsg = self.toast_text()
-            if self.captcha_gate_active():
+            if self.captcha_gate_active() or (response and (
+                    response.get("captcha_required") or response.get("challenge"))):
                 logger.warning("🤖 启动被验证码闸门拦截")
-                return StartStatus.CAPTCHA, tmsg or "需人工过验证码"
+                return StartStatus.CAPTCHA, (response or {}).get("message") or tmsg or "需人工过验证码"
+            if response and response.get("status") == "error":
+                message = classify_start_error(response.get("message", ""))
+                logger.warning("⚠️ 启动失败: %s", message)
+                return StartStatus.FAILED, message
 
-            self.goto_servers()
-            stopped2 = self.check_server_stopped(sid)
-            if stopped2 is False:
-                logger.info(f"🟢 服务器 {masked} 已启动")
-                return StartStatus.STARTED, ""
+            accepted = bool(response and response.get("status") == "success"
+                            and 200 <= response.get("http_status", 0) < 300)
+            # 仅明确接受的请求延长状态等待；不根据 HTTP 200 或按钮缺失认定启动成功。
+            for _ in range(START_CONFIRM_ROUNDS if accepted else 1):
+                time.sleep(5)
+                self.goto_servers()
+                stopped2 = self.check_server_stopped(sid)
+                if stopped2 is False:
+                    logger.info(f"🟢 服务器 {masked} 已启动")
+                    return StartStatus.STARTED, ""
             if stopped2 is None:
                 return StartStatus.UNKNOWN, "运行状态判定失败"
-            if tmsg:
-                _, m = classify_renew_error(tmsg)
-                logger.warning(f"⚠️ 启动失败: {m}")
-                return StartStatus.FAILED, m
-            logger.warning(f"🟡 服务器 {masked} 启动指令已发出，面板仍显示关机")
-            return StartStatus.STOPPED, "启动指令已发出，面板仍显示关机"
+            message = ("启动接口已接受请求，但面板仍显示关机" if accepted
+                       else "启动请求结果未确认，面板仍显示关机")
+            if response and not accepted:
+                message += f"（HTTP {response.get('http_status')}，{response.get('message') or '未返回明确成功状态'}）"
+            logger.warning("🟡 服务器 %s: %s", masked, message)
+            return StartStatus.STOPPED, message
         except Exception as e:
             logger.error(f"❌ 启动服务器 {masked} 失败: {e}")
+            if dispatched:
+                return StartStatus.STOPPED, "启动请求结果未确认，未重复发送"
             return StartStatus.FAILED, str(e)
 
     # ---- 付款页 Turnstile（原 sb_pay.py 的三段结构）----
@@ -721,7 +809,7 @@ class CastleClient:
         return False
 
     def toast_text(self) -> str:
-        """站点续约/开机结果都经 iziToast 呈现；UC 无响应拦截，只能读它。可能同时多条或一条都没有，
+        """站点续约/开机结果都经 iziToast 呈现，用作补充信息。可能同时多条或一条都没有，
         JS 一次拿全、缺失时返回空串。"""
         return js(self.sb, """
             Array.from(document.querySelectorAll('.iziToast-message'))
@@ -901,12 +989,14 @@ def process_account(cookie_str: str, idx: int, notifier: Notifier,
 
             for sid in server_ids:
                 logger.info(f"--- 处理服务器 {mask_id(sid)} ---")
-                pre, _ = client.ensure_running(sid)
+                pre, pre_msg = client.ensure_running(sid)
                 status, msg, screenshot, expiry, days = client.renew(sid)
-                # 续约后复核：启动指令到面板刷新有延迟；若续约前因过期开不了机，续约后可再试
+                # 已接受或结果不明的启动请求只复核；明确拒绝后，续约可能解除过期/验证限制。
                 start, start_msg = client.ensure_running(
-                    sid, allow_start=pre is not StartStatus.STARTED)
-                if start is StartStatus.RUNNING and pre is StartStatus.STARTED:
+                    sid, allow_start=pre not in (StartStatus.STARTED, StartStatus.STOPPED, StartStatus.UNKNOWN))
+                if start is StartStatus.STOPPED and pre is StartStatus.STOPPED:
+                    start_msg = pre_msg
+                if start is StartStatus.RUNNING and pre in (StartStatus.STARTED, StartStatus.STOPPED):
                     start, start_msg = StartStatus.STARTED, ""
                 results.append(
                     ServerResult(sid, status, msg, expiry, days, start, start_msg, screenshot))
